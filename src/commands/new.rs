@@ -1,6 +1,7 @@
 use anyhow::{Result, ensure};
 
 use crate::config::Config;
+use crate::files;
 use crate::git;
 use crate::hooks::{self, HookContext};
 
@@ -27,6 +28,8 @@ pub fn run(config: &Config, branch: &str) -> Result<()> {
     }
 
     git::worktree_add(&repo_root, &sanitized_branch, &target_path)?;
+    files::copy_env_files(&repo_root, &target_path, &config.files.copy)?;
+    files::ensure_gitignore(&repo_root, &target_path)?;
 
     let hook_context = HookContext {
         branch: sanitized_branch,

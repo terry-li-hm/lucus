@@ -8,6 +8,8 @@ pub struct Config {
     pub worktree: WorktreeConfig,
     #[serde(default)]
     pub hooks: HookConfig,
+    #[serde(default)]
+    pub files: FilesConfig,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -37,6 +39,12 @@ pub struct HookConfig {
     pub pre_remove: Vec<String>,
     #[serde(default)]
     pub post_remove: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct FilesConfig {
+    #[serde(default)]
+    pub copy: Vec<String>,
 }
 
 fn default_path_template() -> String {

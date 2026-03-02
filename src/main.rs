@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod files;
 mod git;
 mod hooks;
 mod output;
