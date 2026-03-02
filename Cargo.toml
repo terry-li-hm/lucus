@@ -1,0 +1,28 @@
+[package]
+name = "lucus"
+version = "0.2.0"
+edition = "2024"
+description = "Git worktree manager for parallel AI agent workflows"
+license = "MIT"
+repository = "https://github.com/terry-li-hm/lucus"
+keywords = ["git", "worktree", "ai", "agent"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+directories = "5"
+git2 = "0.20"
+indicatif = "0.17"
+owo-colors = "4"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+ureq = { version = "2", features = ["json"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
