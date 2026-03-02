@@ -171,11 +171,12 @@ pub fn worktree_add(repo_root: &Path, branch: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn worktree_remove(repo_root: &Path, path: &Path) -> Result<()> {
+pub fn worktree_remove(repo_root: &Path, path: &Path, force: bool) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
         .args(["worktree", "remove"])
+        .args(force.then_some("--force"))
         .arg(path)
         .output()
         .with_context(|| {

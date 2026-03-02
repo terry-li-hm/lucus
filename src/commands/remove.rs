@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::git;
 use crate::hooks::{self, HookContext};
 
-pub fn run(config: &Config, branch: &str) -> Result<()> {
+pub fn run(config: &Config, branch: &str, force: bool) -> Result<()> {
     let repo_root = git::repo_root_from_cwd()?;
     let path = git::find_worktree_by_branch(&repo_root, branch)?
         .ok_or_else(|| anyhow!("no worktree found for branch {branch}"))?;
@@ -18,7 +18,7 @@ pub fn run(config: &Config, branch: &str) -> Result<()> {
     };
 
     hooks::run_blocking(&config.hooks.pre_remove, &hook_context)?;
-    git::worktree_remove(&repo_root, &path)?;
+    git::worktree_remove(&repo_root, &path, force)?;
     git::branch_delete(&repo_root, branch)?;
     hooks::run_blocking(&config.hooks.post_remove, &hook_context)?;
 

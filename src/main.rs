@@ -29,7 +29,11 @@ enum Command {
     List,
 
     /// Remove a worktree and delete its branch.
-    Remove { branch: String },
+    Remove {
+        branch: String,
+        #[arg(long, help = "Remove even if the worktree has uncommitted changes")]
+        force: bool,
+    },
 
     /// Print a worktree path for shell wrappers.
     Query {
@@ -67,7 +71,7 @@ fn run() -> anyhow::Result<()> {
             let config = config::load()?;
             match command {
                 Command::New { branch } => commands::new::run(&config, &branch),
-                Command::Remove { branch } => commands::remove::run(&config, &branch),
+                Command::Remove { branch, force } => commands::remove::run(&config, &branch, force),
                 Command::Query { branch } => commands::query::run(&config, &branch),
                 Command::Switch { branch } => commands::switch::run(&config, &branch),
                 Command::Init { shell } => commands::init::run(&shell),
