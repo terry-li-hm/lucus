@@ -103,3 +103,26 @@ fn escape_json(value: &str) -> String {
     }
     escaped
 }
+
+#[cfg(test)]
+mod tests {
+    use super::escape_json;
+
+    #[test]
+    fn escape_json_quotes_backslashes_and_whitespace() {
+        assert_eq!(escape_json(r#"a"b\c"#), r#"a\"b\\c"#);
+        assert_eq!(escape_json("a\nb\rc\td"), "a\\nb\\rc\\td");
+        assert_eq!(escape_json("feat/你好"), "feat/你好");
+        assert_eq!(escape_json(""), "");
+    }
+
+    /// Expected: remaining C0 controls are emitted as `\u00XX` so each NDJSON
+    /// line is valid JSON even when a path contains those bytes.
+    /// Observed: only `\`, `"`, `\n`, `\r`, and `\t` are escaped; a backspace
+    /// character is copied through unchanged.
+    #[test]
+    fn documents_defect_ndjson_skips_control_character_escaping() {
+        assert_eq!(escape_json("\u{0008}"), "\u{0008}");
+        assert_eq!(escape_json("\u{0001}"), "\u{0001}");
+    }
+}

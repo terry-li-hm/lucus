@@ -80,3 +80,107 @@ fn run() -> anyhow::Result<()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_list_without_json() {
+        let cli = Cli::try_parse_from(["lucus", "list"]).unwrap();
+        assert!(!cli.json);
+        assert!(matches!(cli.command, Command::List));
+    }
+
+    #[test]
+    fn parses_global_json_before_and_after_subcommand() {
+        let before = Cli::try_parse_from(["lucus", "--json", "list"]).unwrap();
+        assert!(before.json);
+        assert!(matches!(before.command, Command::List));
+        let after = Cli::try_parse_from(["lucus", "list", "--json"]).unwrap();
+        assert!(after.json);
+    }
+
+    #[test]
+    fn parses_new_branch() {
+        let cli = Cli::try_parse_from(["lucus", "new", "feat/auth"]).unwrap();
+        match cli.command {
+            Command::New { branch } => assert_eq!(branch, "feat/auth"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_remove_force_flag_in_both_positions() {
+        let plain = Cli::try_parse_from(["lucus", "remove", "feat/auth"]).unwrap();
+        match plain.command {
+            Command::Remove { branch, force } => {
+                assert_eq!(branch, "feat/auth");
+                assert!(!force);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let after = Cli::try_parse_from(["lucus", "remove", "feat/auth", "--force"]).unwrap();
+        match after.command {
+            Command::Remove { force, .. } => assert!(force),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let before = Cli::try_parse_from(["lucus", "remove", "--force", "feat/auth"]).unwrap();
+        match before.command {
+            Command::Remove { branch, force } => {
+                assert_eq!(branch, "feat/auth");
+                assert!(force);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_query_symbolic_refs_including_hyphen() {
+        let hyphen = Cli::try_parse_from(["lucus", "query", "-"]).unwrap();
+        match hyphen.command {
+            Command::Query { branch } => assert_eq!(branch, BranchRef::Previous),
+            other => panic!("unexpected {other:?}"),
+        }
+        let caret = Cli::try_parse_from(["lucus", "query", "^"]).unwrap();
+        match caret.command {
+            Command::Query { branch } => assert_eq!(branch, BranchRef::DefaultBranch),
+            other => panic!("unexpected {other:?}"),
+        }
+        let at = Cli::try_parse_from(["lucus", "switch", "@"]).unwrap();
+        match at.command {
+            Command::Switch { branch } => assert_eq!(branch, BranchRef::Current),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_init_shell() {
+        let cli = Cli::try_parse_from(["lucus", "init", "zsh"]).unwrap();
+        match cli.command {
+            Command::Init { shell } => assert_eq!(shell, "zsh"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_missing_subcommand_and_missing_args() {
+        assert!(Cli::try_parse_from(["lucus"]).is_err());
+        assert!(Cli::try_parse_from(["lucus", "new"]).is_err());
+        assert!(Cli::try_parse_from(["lucus", "remove"]).is_err());
+        assert!(Cli::try_parse_from(["lucus", "query"]).is_err());
+        assert!(Cli::try_parse_from(["lucus", "init"]).is_err());
+        assert!(Cli::try_parse_from(["lucus", "unknown"]).is_err());
+    }
+
+    #[test]
+    fn help_and_version_are_clap_display_errors() {
+        let help = Cli::try_parse_from(["lucus", "--help"]).unwrap_err();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let version = Cli::try_parse_from(["lucus", "--version"]).unwrap_err();
+        assert_eq!(version.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+}

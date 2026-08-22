@@ -13,3 +13,18 @@ pub fn detect_format(json_flag: bool) -> OutputFormat {
         OutputFormat::Human
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_flag_forces_ndjson() {
+        assert_eq!(detect_format(true), OutputFormat::Ndjson);
+    }
+
+    #[test]
+    fn json_flag_is_idempotent() {
+        assert_eq!(detect_format(true), detect_format(true));
+    }
+}
