@@ -45,3 +45,46 @@ pub fn resolve_path(config: &Config, branch_ref: &BranchRef) -> Result<std::path
     git::find_worktree_by_branch(&repo_root, &branch)?
         .ok_or_else(|| anyhow!("no worktree found for branch {branch}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::BranchRef;
+    use std::str::FromStr;
+
+    #[test]
+    fn parses_symbolic_shortcuts() {
+        assert_eq!(BranchRef::from_str("-").unwrap(), BranchRef::Previous);
+        assert_eq!(BranchRef::from_str("^").unwrap(), BranchRef::DefaultBranch);
+        assert_eq!(BranchRef::from_str("@").unwrap(), BranchRef::Current);
+    }
+
+    #[test]
+    fn parses_named_branches_including_unicode() {
+        assert_eq!(
+            BranchRef::from_str("feat/auth").unwrap(),
+            BranchRef::Named("feat/auth".to_owned())
+        );
+        assert_eq!(
+            BranchRef::from_str("feat/你好").unwrap(),
+            BranchRef::Named("feat/你好".to_owned())
+        );
+        assert_eq!(
+            BranchRef::from_str("--force").unwrap(),
+            BranchRef::Named("--force".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_branch_ref_is_rejected() {
+        let err = BranchRef::from_str("").expect_err("empty should fail");
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn whitespace_is_a_named_ref_not_a_shortcut() {
+        assert_eq!(
+            BranchRef::from_str(" ").unwrap(),
+            BranchRef::Named(" ".to_owned())
+        );
+    }
+}

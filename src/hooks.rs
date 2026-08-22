@@ -61,3 +61,107 @@ fn path_to_env_value(path: &Path) -> Result<String> {
         .map(ToOwned::to_owned)
         .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        path.push(format!(
+            "lucus-hooks-{label}-{}-{stamp}-{n}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("temp directory should be created");
+        path
+    }
+
+    fn sample_ctx(dir: &std::path::Path) -> HookContext {
+        HookContext {
+            branch: "feat/auth".to_owned(),
+            worktree_path: dir.join("worktree"),
+            repo_root: dir.join("repo"),
+            agent: Some("codex".to_owned()),
+            task: Some("build".to_owned()),
+        }
+    }
+
+    #[test]
+    fn run_blocking_empty_commands_is_ok() {
+        let dir = temp_dir("empty");
+        let ctx = sample_ctx(&dir);
+        run_blocking(&[], &ctx).expect("no commands should succeed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_blocking_injects_env_vars_without_rewriting_the_command() {
+        let dir = temp_dir("env");
+        let ctx = sample_ctx(&dir);
+        let marker = dir.join("env.txt");
+        let command = format!(
+            "printf '%s\\n%s\\n%s\\n%s\\n%s' \"$LUCUS_BRANCH\" \"$LUCUS_WORKTREE_PATH\" \"$LUCUS_REPO\" \"$LUCUS_AGENT\" \"$LUCUS_TASK\" > '{}'",
+            marker.display()
+        );
+        run_blocking(&[command], &ctx).expect("hook should succeed");
+        let body = fs::read_to_string(&marker).expect("marker should exist");
+        let lines: Vec<_> = body.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "feat/auth",
+                ctx.worktree_path.to_str().unwrap(),
+                ctx.repo_root.to_str().unwrap(),
+                "codex",
+                "build",
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_blocking_does_not_interpolate_metacharacters_from_the_branch_name() {
+        let dir = temp_dir("meta");
+        let mut ctx = sample_ctx(&dir);
+        ctx.branch = "$(echo pwned)".to_owned();
+        let marker = dir.join("branch.txt");
+        let command = format!("printf '%s' \"$LUCUS_BRANCH\" > '{}'", marker.display());
+        run_blocking(&[command], &ctx).expect("hook should succeed");
+        assert_eq!(
+            fs::read_to_string(&marker).expect("marker should exist"),
+            "$(echo pwned)"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_blocking_reports_failed_status() {
+        let dir = temp_dir("fail");
+        let ctx = sample_ctx(&dir);
+        let err = run_blocking(&["false".to_owned()], &ctx).expect_err("false should fail");
+        assert!(
+            err.to_string().contains("hook command failed"),
+            "unexpected error: {err:#}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_background_spawns_without_waiting_for_failure() {
+        let dir = temp_dir("bg");
+        let ctx = sample_ctx(&dir);
+        run_background(&["false".to_owned()], &ctx).expect("spawn of false should succeed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

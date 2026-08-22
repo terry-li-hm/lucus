@@ -286,4 +286,158 @@ mod tests {
             "gitignore should not be created for outside targets"
         );
     }
+
+    #[test]
+    fn copy_env_files_creates_missing_target_dir() {
+        let root = TestDir::new("repo-mkdir");
+        let target = root.path().join("missing").join("worktree");
+        copy_env_files(root.path(), &target, &[]).expect("copy should succeed");
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn copy_env_files_skips_directories_named_env() {
+        let root = TestDir::new("repo-env-dir");
+        let target = root.path().join("worktree");
+        fs::create_dir_all(root.path().join(".env")).expect("dir .env should exist");
+        copy_env_files(root.path(), &target, &[".env".to_owned()]).expect("copy should succeed");
+        assert!(
+            !target.join(".env").exists(),
+            "directory sources should be skipped"
+        );
+    }
+
+    #[test]
+    fn copy_env_files_empty_repo_copies_nothing() {
+        let root = TestDir::new("repo-empty");
+        let target = root.path().join("worktree");
+        copy_env_files(root.path(), &target, &[]).expect("copy should succeed");
+        let entries: Vec<_> = fs::read_dir(&target)
+            .expect("target should exist")
+            .collect();
+        assert!(entries.is_empty(), "no env files should be copied");
+    }
+
+    #[test]
+    fn copy_env_files_unicode_env_suffix_is_copied() {
+        let root = TestDir::new("repo-unicode");
+        let target = root.path().join("worktree");
+        fs::write(root.path().join(".env.ünicode"), "OK=1").expect("should write unicode env");
+        copy_env_files(root.path(), &target, &[]).expect("copy should succeed");
+        assert_eq!(
+            fs::read_to_string(target.join(".env.ünicode")).expect("copied file should exist"),
+            "OK=1"
+        );
+    }
+
+    #[test]
+    fn ensure_gitignore_appends_after_file_without_trailing_newline() {
+        let root = TestDir::new("repo-gitignore-nl");
+        let target = root.path().join("worktrees").join("feat-abc");
+        fs::create_dir_all(&target).expect("target path should be created");
+        fs::write(root.path().join(".gitignore"), "target").expect("should write gitignore");
+
+        ensure_gitignore(root.path(), &target).expect("update should succeed");
+
+        let gitignore =
+            fs::read_to_string(root.path().join(".gitignore")).expect("gitignore should exist");
+        assert_eq!(gitignore, "target\nworktrees/\n");
+    }
+
+    /// Expected: with an empty `files.copy` list, creation copies no files and
+    /// never auto-discovers `.env*` (including `.envrc`), so credentials stay
+    /// in the source checkout.
+    /// Observed: empty patterns scan the repo root and copy every filename
+    /// that starts with `.env`, including `.envrc`.
+    #[test]
+    fn documents_defect_copy_env_files_auto_discovers_when_unconfigured() {
+        let root = TestDir::new("repo-autodiscover-defect");
+        let target = root.path().join("worktree");
+        fs::create_dir_all(&target).expect("worktree dir should exist");
+        fs::write(root.path().join(".env"), "FAKECREDENTIAL=1").expect("should write .env");
+        fs::write(root.path().join(".envrc"), "FAKECREDENTIAL=2").expect("should write .envrc");
+
+        copy_env_files(root.path(), &target, &[]).expect("copy should succeed");
+
+        assert_eq!(
+            fs::read_to_string(target.join(".env")).expect("copied .env should exist"),
+            "FAKECREDENTIAL=1"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join(".envrc")).expect("copied .envrc should exist"),
+            "FAKECREDENTIAL=2"
+        );
+    }
+
+    /// Expected: `files.copy` entries are resolved relative to the repo root
+    /// and rejected if they escape it.
+    /// Observed: an absolute pattern replaces the repo root via `Path::join`
+    /// and the file is copied into the worktree.
+    #[test]
+    fn documents_defect_copy_env_files_absolute_pattern_escapes_repo() {
+        let root = TestDir::new("repo-abs-pattern");
+        let outside = TestDir::new("outside-abs-pattern");
+        let target = root.path().join("worktree");
+        fs::create_dir_all(&target).expect("worktree dir should exist");
+        let leaked = outside.path().join("leaked.env");
+        fs::write(&leaked, "FAKECREDENTIAL=1").expect("should write outside file");
+
+        copy_env_files(
+            root.path(),
+            &target,
+            &[leaked.to_string_lossy().into_owned()],
+        )
+        .expect("copy currently succeeds");
+
+        assert_eq!(
+            fs::read_to_string(target.join("leaked.env")).expect("escaped file should be copied"),
+            "FAKECREDENTIAL=1"
+        );
+    }
+
+    /// Expected: `../` components in a copy pattern cannot reach files outside
+    /// the repository.
+    /// Observed: `repo_root.join("../secret.env")` is copied unchanged.
+    #[test]
+    fn documents_defect_copy_env_files_parent_pattern_escapes_repo() {
+        let workspace = TestDir::new("workspace-parent-pattern");
+        let repo = workspace.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo should exist");
+        let target = repo.join("worktree");
+        fs::create_dir_all(&target).expect("worktree dir should exist");
+        fs::write(workspace.path().join("secret.env"), "FAKECREDENTIAL=1")
+            .expect("should write sibling secret");
+
+        copy_env_files(&repo, &target, &["../secret.env".to_owned()])
+            .expect("copy currently succeeds");
+
+        assert_eq!(
+            fs::read_to_string(target.join("secret.env")).expect("escaped file should be copied"),
+            "FAKECREDENTIAL=1"
+        );
+    }
+
+    /// Expected: copy sources that are symlinks are refused, especially when
+    /// they point outside the repository.
+    /// Observed: pattern mode uses `Path::is_file()`, which follows the
+    /// symlink and copies the target's contents.
+    #[test]
+    fn documents_defect_copy_env_files_follows_symlink_in_pattern_mode() {
+        let root = TestDir::new("repo-symlink");
+        let outside = TestDir::new("outside-symlink");
+        let target = root.path().join("worktree");
+        fs::create_dir_all(&target).expect("worktree dir should exist");
+        let leaked = outside.path().join("leaked.env");
+        fs::write(&leaked, "FAKECREDENTIAL=1").expect("should write outside file");
+        std::os::unix::fs::symlink(&leaked, root.path().join(".env"))
+            .expect("symlink should exist");
+
+        copy_env_files(root.path(), &target, &[".env".to_owned()])
+            .expect("copy currently succeeds");
+
+        assert_eq!(
+            fs::read_to_string(target.join(".env")).expect("symlink target should be copied"),
+            "FAKECREDENTIAL=1"
+        );
+    }
 }

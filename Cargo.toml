@@ -18,7 +18,6 @@ owo-colors = "4"
 rayon = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-ureq = { version = "2", features = ["json"] }
 
 [profile.release]
 opt-level = "z"
@@ -26,4 +25,3 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
-

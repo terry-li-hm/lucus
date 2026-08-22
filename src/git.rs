@@ -299,3 +299,334 @@ fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
 
     Ok(base)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let mut path = std::env::temp_dir();
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock should be after unix epoch")
+                .as_nanos();
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            path.push(format!(
+                "lucus-git-{label}-{}-{stamp}-{n}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("temp directory should be created");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn isolate_git(cmd: &mut Command) {
+        cmd.env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Lucus Test")
+            .env("GIT_AUTHOR_EMAIL", "lucus-test@example.com")
+            .env("GIT_COMMITTER_NAME", "Lucus Test")
+            .env("GIT_COMMITTER_EMAIL", "lucus-test@example.com")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_TEMPLATE_DIR");
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        let mut cmd = Command::new("git");
+        cmd.args(["-C"]).arg(dir).args(args);
+        isolate_git(&mut cmd);
+        let output = cmd.output().expect("git should run");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
+    fn init_repo(label: &str) -> TestDir {
+        let dir = TestDir::new(label);
+        let mut cmd = Command::new("git");
+        cmd.args(["init", "-b", "main"]).arg(dir.path());
+        isolate_git(&mut cmd);
+        let output = cmd.output().expect("git init should run");
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        git(dir.path(), &["config", "user.name", "Lucus Test"]);
+        git(
+            dir.path(),
+            &["config", "user.email", "lucus-test@example.com"],
+        );
+        git(dir.path(), &["config", "commit.gpgsign", "false"]);
+        fs::write(dir.path().join("README.md"), "hello").expect("write readme");
+        git(dir.path(), &["add", "README.md"]);
+        git(dir.path(), &["commit", "-m", "init"]);
+        dir
+    }
+
+    fn branch_exists(repo: &Path, branch: &str) -> bool {
+        let mut cmd = Command::new("git");
+        cmd.args(["-C"])
+            .arg(repo)
+            .args(["show-ref", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{branch}"));
+        isolate_git(&mut cmd);
+        cmd.status().expect("git show-ref should run").success()
+    }
+
+    #[test]
+    fn sanitize_branch_keeps_safe_characters() {
+        assert_eq!(sanitize_branch("feat/auth"), "feat/auth");
+        assert_eq!(sanitize_branch("feat-auth_1"), "feat-auth_1");
+        assert_eq!(sanitize_branch(""), "");
+    }
+
+    #[test]
+    fn sanitize_branch_strips_spaces_and_unicode_and_caps_length() {
+        assert_eq!(sanitize_branch("feat/foo bar"), "feat/foobar");
+        assert_eq!(sanitize_branch("feat/你好"), "feat/");
+        assert_eq!(sanitize_branch("!!!"), "");
+        let long = "a".repeat(80);
+        assert_eq!(sanitize_branch(&long).len(), 60);
+    }
+
+    #[test]
+    fn sanitize_branch_strips_dots_from_path_traversal_attempts() {
+        assert_eq!(sanitize_branch("../../../etc/passwd"), "///etc/passwd");
+    }
+
+    /// Expected: a user-supplied branch such as `release/1.2.3` is created
+    /// unchanged; sanitization is only for path substitution / generated names.
+    /// Observed: `.` is stripped, so `release/1.2.3` becomes `release/123`.
+    #[test]
+    fn documents_defect_sanitize_strips_dots_from_user_branch() {
+        assert_eq!(sanitize_branch("release/1.2.3"), "release/123");
+        assert_eq!(sanitize_branch("v1.0.0"), "v100");
+    }
+
+    /// Expected: leading dashes are stripped or the git subprocess is given
+    /// `--` so the branch cannot be parsed as a flag.
+    /// Observed: `--force` survives sanitization and would be passed as `-b
+    /// --force`.
+    #[test]
+    fn documents_defect_sanitize_keeps_leading_dashes() {
+        assert_eq!(sanitize_branch("--force"), "--force");
+        assert_eq!(sanitize_branch("-n"), "-n");
+    }
+
+    #[test]
+    fn resolve_worktree_path_renders_default_template_outside_repo() {
+        let repo = init_repo("resolve-default");
+        let path = resolve_worktree_path("../{repo}.{branch}", repo.path(), "feat-auth")
+            .expect("default template should resolve");
+        let repo_name = repo.path().file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            path,
+            repo.path()
+                .parent()
+                .unwrap()
+                .join(format!("{repo_name}.feat-auth"))
+        );
+        assert!(!path.starts_with(repo.path()));
+    }
+
+    #[test]
+    fn resolve_worktree_path_rejects_empty_sanitized_branch() {
+        let repo = init_repo("resolve-empty");
+        let err = resolve_worktree_path("../{repo}.{branch}", repo.path(), "!!!")
+            .expect_err("empty sanitized branch should fail");
+        assert!(
+            err.to_string().contains("empty after sanitization"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn resolve_worktree_path_accepts_absolute_template_outside_repo() {
+        let repo = init_repo("resolve-abs");
+        let outside = TestDir::new("abs-target-root");
+        let template = format!("{}/{{branch}}", outside.path().display());
+        let path = resolve_worktree_path(&template, repo.path(), "feat-auth")
+            .expect("absolute outside path should resolve");
+        assert_eq!(path, outside.path().join("feat-auth"));
+    }
+
+    /// Expected: in-repo templates such as `.worktrees/{branch}` are allowed
+    /// so `ensure_gitignore` can ignore the parent directory.
+    /// Observed: any resolved path inside the source repository is rejected.
+    #[test]
+    fn documents_defect_in_repo_worktree_path_rejected() {
+        let repo = init_repo("resolve-inside");
+        let err = resolve_worktree_path(".worktrees/{branch}", repo.path(), "feat-auth")
+            .expect_err("in-repo template currently fails");
+        assert!(
+            err.to_string().contains("inside source repository"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn list_worktrees_includes_main_checkout() {
+        let repo = init_repo("list-main");
+        let entries = list_worktrees(repo.path()).expect("list should succeed");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].branch, "main");
+        assert_eq!(
+            entries[0].path,
+            repo.path().canonicalize().expect("canonicalize repo")
+        );
+    }
+
+    #[test]
+    fn current_branch_reads_head() {
+        let repo = init_repo("current");
+        assert_eq!(current_branch(repo.path()).expect("branch"), "main");
+    }
+
+    #[test]
+    fn find_worktree_by_branch_none_for_unknown() {
+        let repo = init_repo("find-none");
+        assert_eq!(
+            find_worktree_by_branch(repo.path(), "no-such").expect("find"),
+            None
+        );
+    }
+
+    #[test]
+    fn worktree_add_and_stats_and_remove() {
+        let repo = init_repo("wt-lifecycle");
+        let wt = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-auth", &wt).expect("worktree add");
+        let found = find_worktree_by_branch(repo.path(), "feat-auth")
+            .expect("find")
+            .expect("path");
+        assert_eq!(found, wt.canonicalize().expect("canonicalize worktree"));
+
+        let clean = worktree_stats(&wt).expect("stats");
+        assert_eq!(clean.uncommitted, 0);
+
+        fs::write(wt.join("dirty.txt"), "x").expect("dirty file");
+        let dirty = worktree_stats(&wt).expect("dirty stats");
+        assert_eq!(dirty.uncommitted, 1);
+
+        worktree_remove(repo.path(), &wt, true).expect("force remove dirty worktree");
+        branch_delete(repo.path(), "feat-auth").expect("delete branch");
+        assert!(!wt.exists());
+        assert!(!branch_exists(repo.path(), "feat-auth"));
+    }
+
+    #[test]
+    fn worktree_remove_without_force_fails_on_dirty_tree() {
+        let repo = init_repo("wt-dirty");
+        let wt = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-dirty-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-dirty", &wt).expect("worktree add");
+        fs::write(wt.join("dirty.txt"), "x").expect("dirty file");
+        let err = worktree_remove(repo.path(), &wt, false).expect_err("dirty remove should fail");
+        assert!(
+            err.to_string().contains("git worktree remove failed"),
+            "unexpected error: {err:#}"
+        );
+        assert!(wt.exists());
+        worktree_remove(repo.path(), &wt, true).expect("cleanup");
+        branch_delete(repo.path(), "feat-dirty").expect("cleanup branch");
+    }
+
+    #[test]
+    fn previous_branch_fails_without_checkout_history() {
+        let repo = init_repo("prev-none");
+        let err = previous_branch(repo.path()).expect_err("no previous branch");
+        assert!(
+            err.to_string()
+                .contains("unable to resolve previous branch"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn worktree_add_fails_when_branch_already_exists() {
+        let repo = init_repo("wt-dup");
+        let wt = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-dup-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-dup", &wt).expect("first add");
+        let wt2 = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-dup2-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let err = worktree_add(repo.path(), "feat-dup", &wt2).expect_err("duplicate branch");
+        assert!(
+            err.to_string().contains("git worktree add failed"),
+            "unexpected error: {err:#}"
+        );
+        worktree_remove(repo.path(), &wt, false).expect("cleanup");
+        branch_delete(repo.path(), "feat-dup").expect("cleanup branch");
+    }
+
+    /// Expected: ordinary branch deletion uses `git branch -d` and refuses
+    /// unique commits that are not merged.
+    /// Observed: `branch_delete` always runs `git branch -D`, so an unmerged
+    /// branch is removed and its unique commits become unreachable.
+    #[test]
+    fn documents_defect_branch_delete_force_drops_unmerged_commits() {
+        let repo = init_repo("force-delete");
+        git(repo.path(), &["checkout", "-b", "unique"]);
+        fs::write(repo.path().join("unique.txt"), "only-on-unique").expect("write unique");
+        git(repo.path(), &["add", "unique.txt"]);
+        git(repo.path(), &["commit", "-m", "unique commit"]);
+        let sha = String::from_utf8_lossy(&git(repo.path(), &["rev-parse", "HEAD"]).stdout)
+            .trim()
+            .to_owned();
+        git(repo.path(), &["checkout", "main"]);
+
+        branch_delete(repo.path(), "unique").expect("force delete currently succeeds");
+        assert!(!branch_exists(repo.path(), "unique"));
+
+        let mut cat_cmd = Command::new("git");
+        cat_cmd
+            .args(["-C"])
+            .arg(repo.path())
+            .args(["cat-file", "-t", &sha]);
+        isolate_git(&mut cat_cmd);
+        let cat = cat_cmd.output().expect("cat-file");
+        assert!(
+            cat.status.success(),
+            "unique commit object should still exist until gc"
+        );
+    }
+}
