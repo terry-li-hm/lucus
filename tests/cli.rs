@@ -763,7 +763,7 @@ fn new_rolls_back_when_copy_entry_is_invalid() {
     let code = assert_failure(&output);
     assert_eq!(code, 1);
     assert!(
-        stderr(&output).contains("is a directory"),
+        stderr(&output).contains("not a regular file"),
         "unexpected stderr: {}",
         stderr(&output)
     );
@@ -850,6 +850,135 @@ fn new_preserves_worktree_when_hook_leaves_untracked_file() {
     assert!(branch_exists(&fx, "feat-hook-leftover"));
 
     let removed = fx.lucus(&["remove", "--force", "feat-hook-leftover"]);
+    assert_success(&removed);
+}
+
+/// Regression: a configured copy entry that names a tracked file must not
+/// overwrite the checked-out copy in the new worktree. Creation fails with
+/// an overwrite refusal, the tracked content stays intact, and because the
+/// worktree is otherwise clean the rollback may remove it and the branch.
+#[test]
+fn new_refuses_to_overwrite_tracked_copy_destination_and_rolls_back_clean() {
+    let fx = Fixture::new("tracked-copy-destination");
+    fs::write(fx.repo.join("tracked.txt"), "tracked content").expect("write tracked file");
+    git(&fx.repo, &fx.root, &["add", "tracked.txt"]);
+    git(&fx.repo, &fx.root, &["commit", "-m", "add tracked"]);
+    fx.write_config("[files]\ncopy = [\"tracked.txt\"]\n");
+
+    let output = fx.lucus(&["new", "feat-tracked-copy"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    assert!(
+        stderr(&output).contains("refusing to overwrite existing file"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("rolled back"),
+        "clean creation may be rolled back: {}",
+        stderr(&output)
+    );
+    // The tracked content was never overwritten.
+    assert_eq!(
+        fs::read_to_string(fx.repo.join("tracked.txt")).expect("tracked file intact"),
+        "tracked content"
+    );
+    assert!(
+        !fx.root.join("repo.feat-tracked-copy").exists(),
+        "clean worktree must be rolled back"
+    );
+    assert!(
+        !branch_exists(&fx, "feat-tracked-copy"),
+        "branch must be rolled back"
+    );
+}
+
+/// Regression: `git worktree add` runs repository post-checkout hooks before
+/// `files.copy`, so a hook can create a unique ignored destination first.
+/// lucus must refuse to overwrite its distinct contents and preserve it.
+#[test]
+fn new_refuses_to_overwrite_ignored_file_created_by_post_checkout_hook() {
+    let fx = Fixture::new("post-checkout-hook-env");
+    fs::write(fx.repo.join(".env"), "LUCUS=source").expect("write source env");
+    fs::write(fx.repo.join(".gitignore"), ".env\n").expect("write gitignore");
+    git(&fx.repo, &fx.root, &["add", ".gitignore"]);
+    git(&fx.repo, &fx.root, &["commit", "-m", "ignore env"]);
+    fx.write_config("[files]\ncopy = [\".env\"]\n");
+
+    // A synthetic repository hook runs during the checkout that `git
+    // worktree add` performs, before lucus copies anything.
+    let hooks_dir = fx.repo.join(".git").join("hooks");
+    fs::create_dir_all(&hooks_dir).expect("hooks dir exists");
+    fs::write(
+        hooks_dir.join("post-checkout"),
+        "#!/bin/sh\nprintf 'HOOK-OWNED' > ./.env\n",
+    )
+    .expect("write post-checkout hook");
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(
+        hooks_dir.join("post-checkout"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("make hook executable");
+
+    let output = fx.lucus(&["new", "feat-hook-env"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    assert!(
+        stderr(&output).contains("refusing to overwrite existing file"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    let path = fx.root.join("repo.feat-hook-env");
+    assert!(path.is_dir(), "worktree must be preserved");
+    assert_eq!(
+        fs::read_to_string(path.join(".env")).expect("hook file survives"),
+        "HOOK-OWNED",
+        "the hook's distinct contents must never be overwritten"
+    );
+    assert!(
+        branch_exists(&fx, "feat-hook-env"),
+        "branch must be preserved"
+    );
+
+    let removed = fx.lucus(&["remove", "--force", "feat-hook-env"]);
+    assert_success(&removed);
+}
+
+/// Regression: a configured copy entry that is missing from the repo copies
+/// nothing; a hook-created ignored file with the same basename is unique
+/// state and must survive a failed creation instead of being rolled back
+/// as if lucus had copied it.
+#[test]
+fn new_preserves_ignored_hook_file_matching_missing_copy_entry() {
+    let fx = Fixture::new("preserve-ignored-hook-file");
+    fs::write(fx.repo.join(".gitignore"), ".env\n").expect("write gitignore");
+    git(&fx.repo, &fx.root, &["add", ".gitignore"]);
+    git(&fx.repo, &fx.root, &["commit", "-m", "ignore env"]);
+    fx.write_config(
+        "[files]\ncopy = [\".env\"]\n[hooks]\npost_create = ['touch \"$LUCUS_WORKTREE_PATH/.env\"', 'false']\n",
+    );
+
+    let output = fx.lucus(&["new", "feat-ignored-env"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    assert!(
+        stderr(&output).contains("may contain unique state"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    let path = fx.root.join("repo.feat-ignored-env");
+    assert!(path.is_dir(), "worktree must be preserved");
+    assert!(
+        path.join(".env").is_file(),
+        "hook-created ignored file must be preserved"
+    );
+    assert!(
+        branch_exists(&fx, "feat-ignored-env"),
+        "branch must be preserved"
+    );
+
+    let removed = fx.lucus(&["remove", "--force", "feat-ignored-env"]);
     assert_success(&removed);
 }
 

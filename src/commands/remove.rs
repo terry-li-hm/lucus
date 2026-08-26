@@ -10,10 +10,10 @@ pub fn run(config: &Config, branch: &str, force: bool) -> Result<()> {
         Some(path) => path,
         None => {
             // Recovery: the working directory may have been lost out of band.
-            // Delete the branch first with the same merged-state protection as
-            // the normal path, and prune the stale registration only after that
-            // succeeds so a refused removal stays retryable. Hooks are skipped:
-            // there is no worktree left for them to act on.
+            // Prune the (already dead) registration first, then delete the
+            // branch with the same merged-state protection as the normal
+            // path. Hooks are skipped: there is no worktree left for them
+            // to act on.
             let stale = git::stale_worktrees(&repo_root)?;
             if let Some(matched) = stale
                 .iter()

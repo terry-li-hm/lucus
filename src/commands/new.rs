@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::config::Config;
-use crate::files;
+use crate::files::{self, CopiedFile};
 use crate::git;
 use crate::hooks::{self, HookContext};
 
@@ -22,27 +22,19 @@ pub fn run(config: &Config, branch: &str) -> Result<()> {
     }
 
     let base_sha = git::rev_parse(&repo_root, "HEAD")?;
-    let copied_names: Vec<String> = config
-        .files
-        .copy
-        .iter()
-        .filter_map(|entry| {
-            Path::new(entry)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_owned)
-        })
-        .collect();
 
     git::worktree_add(&repo_root, branch, &target_path)?;
 
-    if let Err(err) = finalize_creation(config, branch, &repo_root, &target_path) {
+    // Exact records of the copies lucus completed, appended only after each
+    // successful copy so they survive a mid-copy failure intact.
+    let mut copied: Vec<CopiedFile> = Vec::new();
+    if let Err(err) = finalize_creation(config, branch, &repo_root, &target_path, &mut copied) {
         return Err(handle_creation_failure(
             &repo_root,
             &target_path,
             branch,
             &base_sha,
-            &copied_names,
+            &copied,
             err,
         ));
     }
@@ -58,8 +50,9 @@ fn finalize_creation(
     branch: &str,
     repo_root: &Path,
     target_path: &Path,
+    copied: &mut Vec<CopiedFile>,
 ) -> Result<()> {
-    files::copy_env_files(repo_root, target_path, &config.files.copy)?;
+    files::copy_env_files(repo_root, target_path, &config.files.copy, copied)?;
     files::ensure_gitignore(repo_root, target_path)?;
 
     let hook_context = HookContext {
@@ -83,7 +76,7 @@ fn handle_creation_failure(
     target_path: &Path,
     branch: &str,
     base_sha: &str,
-    copied: &[String],
+    copied: &[CopiedFile],
     err: anyhow::Error,
 ) -> anyhow::Error {
     let eligible =
@@ -91,7 +84,7 @@ fn handle_creation_failure(
             .unwrap_or(false);
 
     if eligible {
-        match git::rollback_clean_creation(repo_root, target_path, branch, copied) {
+        match git::rollback_clean_creation(repo_root, target_path, branch, base_sha, copied) {
             Ok(()) => err.context(
                 "creation failed; rolled back the freshly created clean worktree and branch",
             ),

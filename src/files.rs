@@ -1,8 +1,25 @@
 use anyhow::{Context, Result, ensure};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-pub fn copy_env_files(repo_root: &Path, target_path: &Path, patterns: &[String]) -> Result<()> {
+/// An exact record of one file lucus copied into a worktree.
+///
+/// Records are appended only after each successful copy, so they never
+/// overstate what exists on disk; rollback uses them as the complete set of
+/// destinations it may remove.
+#[derive(Clone, Debug)]
+pub struct CopiedFile {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+}
+
+pub fn copy_env_files(
+    repo_root: &Path,
+    target_path: &Path,
+    patterns: &[String],
+    records: &mut Vec<CopiedFile>,
+) -> Result<()> {
     let sources = env_sources(repo_root, patterns)?;
     if sources.is_empty() {
         return Ok(());
@@ -16,22 +33,84 @@ pub fn copy_env_files(repo_root: &Path, target_path: &Path, patterns: &[String])
     })?;
 
     for source in sources {
-        if !source.is_file() {
-            continue;
-        }
+        // Only a NotFound entry is skipped (the allowlist may list
+        // machine-specific optional files); every other metadata error —
+        // permissions, I/O faults — propagates instead of silently
+        // under-copying.
+        let metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "failed to inspect copy source {}",
+                    source.display()
+                )));
+            }
+        };
+        ensure!(
+            metadata.is_file(),
+            "files.copy source {} is not a regular file; only regular files can be copied",
+            source.display()
+        );
 
         let Some(file_name) = source.file_name() else {
             continue;
         };
         let destination = target_path.join(file_name);
 
-        fs::copy(&source, &destination).with_context(|| {
-            format!(
-                "failed to copy env file {} to {}",
-                source.display(),
-                destination.display()
-            )
-        })?;
+        // Open the source first and validate regular-file status from the
+        // open handle, so the checked metadata belongs to the file actually
+        // read; the captured permission object is reused for the copy.
+        let mut source_file = fs::File::open(&source)
+            .with_context(|| format!("failed to copy env file {}", source.display()))?;
+        let source_metadata = source_file
+            .metadata()
+            .with_context(|| format!("failed to read metadata of {}", source.display()))?;
+        if !source_metadata.is_file() {
+            anyhow::bail!(
+                "files.copy source {} is not a regular file; only regular files can be copied",
+                source.display()
+            );
+        }
+        let permissions = source_metadata.permissions();
+
+        // Create-new semantics: an atomic exclusive create that never
+        // overwrites anything a repository post-checkout hook (or anything
+        // else) may have already placed at the destination. If a later
+        // write fails, the unrecorded destination stays behind as a dirty
+        // path that fails rollback eligibility, preserving the worktree.
+        let mut destination_file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                anyhow::bail!(
+                    "refusing to overwrite existing file {}",
+                    destination.display()
+                );
+            }
+            Err(err) => {
+                return Err(anyhow::Error::new(err)
+                    .context(format!("failed to create {}", destination.display())));
+            }
+        };
+
+        // Stream the copy so memory stays bounded for any file size. A
+        // failure here leaves a partial unrecorded destination that fails
+        // rollback eligibility — fail-closed.
+        std::io::copy(&mut source_file, &mut destination_file)
+            .with_context(|| format!("failed to write env file {}", destination.display()))?;
+        destination_file
+            .set_permissions(permissions)
+            .with_context(|| format!("failed to set permissions on {}", destination.display()))?;
+
+        // Recorded only now, after the copy succeeded.
+        records.push(CopiedFile {
+            source: source.clone(),
+            destination,
+        });
     }
 
     Ok(())
@@ -125,16 +204,21 @@ fn env_sources(repo_root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {
         let candidate = repo_root.join(relative);
         match fs::symlink_metadata(&candidate) {
             // Missing entries are skipped; the allowlist may list
-            // machine-specific optional files.
-            Err(_) => continue,
+            // machine-specific optional files. Every other metadata
+            // error propagates.
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(anyhow::Error::new(err)
+                    .context(format!("failed to inspect files.copy entry '{pattern}'")));
+            }
             Ok(metadata) => {
                 ensure!(
                     !metadata.file_type().is_symlink(),
                     "files.copy entry '{pattern}' is a symlink; refusing to copy through symlinks"
                 );
                 ensure!(
-                    !metadata.is_dir(),
-                    "files.copy entry '{pattern}' is a directory; only regular files can be copied"
+                    metadata.is_file(),
+                    "files.copy entry '{pattern}' is not a regular file; only regular files can be copied"
                 );
             }
         }
@@ -251,6 +335,7 @@ mod tests {
             root.path(),
             &target,
             &[".env".to_owned(), ".env.local".to_owned()],
+            &mut Vec::new(),
         )
         .expect("copy should succeed");
 
@@ -276,7 +361,8 @@ mod tests {
         fs::write(root.path().join(".env"), "ROOT=1").expect("should write .env");
 
         let patterns = vec![".env".to_owned(), ".env.missing".to_owned()];
-        copy_env_files(root.path(), &target, &patterns).expect("copy should succeed");
+        let mut records = Vec::new();
+        copy_env_files(root.path(), &target, &patterns, &mut records).expect("copy should succeed");
 
         assert!(
             target.join(".env").exists(),
@@ -329,7 +415,9 @@ mod tests {
         let root = TestDir::new("repo-mkdir");
         fs::write(root.path().join(".env"), "ROOT=1").expect("should write .env");
         let target = root.path().join("missing").join("worktree");
-        copy_env_files(root.path(), &target, &[".env".to_owned()]).expect("copy should succeed");
+        let mut records = Vec::new();
+        copy_env_files(root.path(), &target, &[".env".to_owned()], &mut records)
+            .expect("copy should succeed");
         assert!(target.is_dir());
         assert!(target.join(".env").exists());
     }
@@ -340,10 +428,11 @@ mod tests {
         let target = root.path().join("worktree");
         fs::create_dir_all(root.path().join("conf")).expect("directory entry should exist");
         fs::create_dir_all(&target).expect("worktree dir should exist");
-        let err = copy_env_files(root.path(), &target, &["conf".to_owned()])
+        let mut records = Vec::new();
+        let err = copy_env_files(root.path(), &target, &["conf".to_owned()], &mut records)
             .expect_err("directory entries should be rejected");
         assert!(
-            err.to_string().contains("is a directory"),
+            err.to_string().contains("not a regular file"),
             "unexpected error: {err:#}"
         );
         assert!(
@@ -359,7 +448,8 @@ mod tests {
     fn copy_env_files_empty_repo_copies_nothing() {
         let root = TestDir::new("repo-empty");
         let target = root.path().join("worktree");
-        copy_env_files(root.path(), &target, &[]).expect("copy should succeed");
+        let mut records = Vec::new();
+        copy_env_files(root.path(), &target, &[], &mut records).expect("copy should succeed");
         assert!(
             !target.exists(),
             "empty allowlist should have no filesystem side effects"
@@ -371,8 +461,13 @@ mod tests {
         let root = TestDir::new("repo-unicode");
         let target = root.path().join("worktree");
         fs::write(root.path().join(".env.ünicode"), "OK=1").expect("should write unicode env");
-        copy_env_files(root.path(), &target, &[".env.ünicode".to_owned()])
-            .expect("copy should succeed");
+        copy_env_files(
+            root.path(),
+            &target,
+            &[".env.ünicode".to_owned()],
+            &mut Vec::new(),
+        )
+        .expect("copy should succeed");
         assert_eq!(
             fs::read_to_string(target.join(".env.ünicode")).expect("copied file should exist"),
             "OK=1"
@@ -404,7 +499,8 @@ mod tests {
         fs::write(root.path().join(".env"), "FAKECREDENTIAL=1").expect("should write .env");
         fs::write(root.path().join(".envrc"), "FAKECREDENTIAL=2").expect("should write .envrc");
 
-        copy_env_files(root.path(), &target, &[]).expect("copy should succeed");
+        let mut records = Vec::new();
+        copy_env_files(root.path(), &target, &[], &mut records).expect("copy should succeed");
 
         assert!(
             !target.join(".env").exists(),
@@ -428,10 +524,12 @@ mod tests {
         let leaked = outside.path().join("leaked.env");
         fs::write(&leaked, "FAKECREDENTIAL=1").expect("should write outside file");
 
+        let mut records = Vec::new();
         let err = copy_env_files(
             root.path(),
             &target,
             &[leaked.to_string_lossy().into_owned()],
+            &mut records,
         )
         .expect_err("absolute entries should be rejected");
 
@@ -454,7 +552,8 @@ mod tests {
         fs::write(workspace.path().join("secret.env"), "FAKECREDENTIAL=1")
             .expect("should write sibling secret");
 
-        let err = copy_env_files(&repo, &target, &["../secret.env".to_owned()])
+        let mut records = Vec::new();
+        let err = copy_env_files(&repo, &target, &["../secret.env".to_owned()], &mut records)
             .expect_err("parent traversal should be rejected");
 
         assert!(
@@ -462,6 +561,65 @@ mod tests {
             "unexpected error: {err:#}"
         );
         assert!(!target.join("secret.env").exists());
+    }
+
+    /// Regression: non-regular files such as Unix sockets are rejected
+    /// instead of silently skipped.
+    #[test]
+    fn copy_env_files_rejects_unix_socket_entry() {
+        let root = TestDir::new("repo-socket");
+        let target = root.path().join("worktree");
+        fs::create_dir_all(&target).expect("worktree dir should exist");
+        let socket_path = root.path().join("agent.env");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path)
+            .expect("unix socket should be created");
+
+        let mut records = Vec::new();
+        let err = copy_env_files(
+            root.path(),
+            &target,
+            &["agent.env".to_owned()],
+            &mut records,
+        )
+        .expect_err("socket entries should be rejected");
+
+        assert!(
+            err.to_string().contains("not a regular file"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            records.is_empty(),
+            "no record may exist for a rejected entry"
+        );
+        assert!(
+            fs::read_dir(&target)
+                .expect("target readable")
+                .next()
+                .is_none(),
+            "rejected entries must not be copied"
+        );
+    }
+
+    /// Regression: records describe exactly the copies that succeeded,
+    /// each with its exact source and destination.
+    #[test]
+    fn copy_env_files_records_exact_source_and_destination() {
+        let root = TestDir::new("repo-records");
+        fs::write(root.path().join(".env"), "ROOT=1").expect("should write .env");
+        let target = root.path().join("worktree");
+
+        let mut records = Vec::new();
+        copy_env_files(
+            root.path(),
+            &target,
+            &[".env".to_owned(), ".env.missing".to_owned()],
+            &mut records,
+        )
+        .expect("copy should succeed");
+
+        assert_eq!(records.len(), 1, "only successful copies are recorded");
+        assert_eq!(records[0].source, root.path().join(".env"));
+        assert_eq!(records[0].destination, target.join(".env"));
     }
 
     /// Regression: copy sources that are symlinks are refused, including
@@ -477,7 +635,8 @@ mod tests {
         std::os::unix::fs::symlink(&leaked, root.path().join(".env"))
             .expect("symlink should exist");
 
-        let err = copy_env_files(root.path(), &target, &[".env".to_owned()])
+        let mut records = Vec::new();
+        let err = copy_env_files(root.path(), &target, &[".env".to_owned()], &mut records)
             .expect_err("symlink entries should be rejected");
 
         assert!(
@@ -501,8 +660,14 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), root.path().join("link"))
             .expect("symlinked directory should exist");
 
-        let err = copy_env_files(root.path(), &target, &["link/leaked.env".to_owned()])
-            .expect_err("escaping entries should be rejected");
+        let mut records = Vec::new();
+        let err = copy_env_files(
+            root.path(),
+            &target,
+            &["link/leaked.env".to_owned()],
+            &mut records,
+        )
+        .expect_err("escaping entries should be rejected");
 
         assert!(
             err.to_string().contains("resolves outside the repository"),

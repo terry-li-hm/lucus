@@ -1,8 +1,11 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use git2::Repository;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+
+use crate::files::CopiedFile;
 
 #[derive(Clone, Debug)]
 pub struct WorktreeEntry {
@@ -198,12 +201,15 @@ pub fn rev_parse(repo_root: &Path, revision: &str) -> Result<String> {
     Ok(value)
 }
 
-/// Paths reported dirty or untracked by `git status --porcelain`.
+/// Paths reported dirty, untracked, or ignored by `git status --porcelain`.
+///
+/// Ignored paths are included: a hook-created ignored file is state that a
+/// rollback must see before deciding the worktree holds nothing unique.
 pub fn dirty_paths(worktree_path: &Path) -> Result<Vec<String>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(worktree_path)
-        .args(["status", "--porcelain"])
+        .args(["status", "--porcelain", "--ignored"])
         .output()
         .with_context(|| {
             format!(
@@ -234,15 +240,16 @@ pub fn dirty_paths(worktree_path: &Path) -> Result<Vec<String>> {
 /// Eligible only when every check proves there is no unique state:
 /// the worktree is still registered for and attached to `branch`, the branch
 /// still points at `base_sha` (the commit the worktree was created from),
-/// and every file differing from the checkout is one of the copies lucus
-/// made (`copied`) and is still byte-identical to its source in the main
-/// checkout (`repo_root`).
+/// and every path differing from the checkout — dirty, untracked, or
+/// ignored — exactly matches the worktree-relative destination of a copy
+/// lucus actually completed (`copied`) and is still byte-identical to its
+/// recorded source.
 pub fn creation_is_rollback_eligible(
     repo_root: &Path,
     worktree_path: &Path,
     branch: &str,
     base_sha: &str,
-    copied: &[String],
+    copied: &[CopiedFile],
 ) -> Result<bool> {
     if ensure_worktree_attached_to_branch(repo_root, worktree_path, branch).is_err() {
         return Ok(false);
@@ -256,17 +263,14 @@ pub fn creation_is_rollback_eligible(
     }
 
     for path in dirty_paths(worktree_path)? {
-        // Only files lucus itself copied may differ, and only while still
-        // byte-identical to their source in the main checkout.
-        let Some(name) = Path::new(&path).file_name().and_then(|n| n.to_str()) else {
+        // Every differing path must be exactly one of the copies lucus made
+        // (matched by worktree-relative destination) and still byte-identical
+        // to its recorded source.
+        let target = worktree_path.join(&path);
+        let Some(record) = copied.iter().find(|record| record.destination == target) else {
             return Ok(false);
         };
-        if !copied.iter().any(|copied| copied == name) {
-            return Ok(false);
-        }
-        let source = repo_root.join(name);
-        let target = worktree_path.join(name);
-        match (fs::read(&source), fs::read(&target)) {
+        match (fs::read(&record.source), fs::read(&target)) {
             (Ok(source_bytes), Ok(target_bytes)) if source_bytes == target_bytes => {}
             _ => return Ok(false),
         }
@@ -278,26 +282,114 @@ pub fn creation_is_rollback_eligible(
 /// Roll back a rollback-eligible creation without force: remove only the
 /// byte-identical copies lucus made, then remove the worktree and delete the
 /// branch with ordinary merged-state protection.
+///
+/// Before acting, branch attachment and the base tip are revalidated, every
+/// planned removal is planned up front (destination exists, is a plain
+/// regular file, is untracked in git, and is still byte-identical to its
+/// recorded source), and any uncertainty aborts with nothing removed.
 pub fn rollback_clean_creation(
     repo_root: &Path,
     worktree_path: &Path,
     branch: &str,
-    copied: &[String],
+    base_sha: &str,
+    copied: &[CopiedFile],
 ) -> Result<()> {
-    for name in copied {
-        let target = worktree_path.join(name);
-        if target.exists() {
-            fs::remove_file(&target).with_context(|| {
-                format!(
-                    "failed to remove copied file {} during rollback",
-                    target.display()
-                )
-            })?;
+    ensure_worktree_attached_to_branch(repo_root, worktree_path, branch)?;
+    let tip = rev_parse(repo_root, &format!("refs/heads/{branch}"))?;
+    ensure!(
+        tip == base_sha,
+        "branch {branch} moved from the base commit since creation; \
+         refusing to roll back"
+    );
+
+    // Plan every removal before acting on any of them.
+    let mut planned = Vec::new();
+    for record in copied {
+        let destination = &record.destination;
+        let metadata = match fs::symlink_metadata(destination) {
+            Ok(metadata) => metadata,
+            // The copy is already gone; nothing to plan.
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(anyhow::Error::new(err).context(format!(
+                    "failed to inspect copied file {} during rollback",
+                    destination.display()
+                )));
+            }
+        };
+        ensure!(
+            metadata.is_file(),
+            "copied destination {} is not a regular file; preserving the worktree",
+            destination.display()
+        );
+
+        let relative = destination.strip_prefix(worktree_path).with_context(|| {
+            format!(
+                "copied destination {} is outside the worktree",
+                destination.display()
+            )
+        })?;
+        if is_tracked(worktree_path, relative)? {
+            anyhow::bail!(
+                "copied destination {} is tracked by git; preserving the worktree",
+                destination.display()
+            );
         }
+
+        let (source_bytes, target_bytes) = match (fs::read(&record.source), fs::read(destination)) {
+            (Ok(source), Ok(target)) => (source, target),
+            _ => {
+                anyhow::bail!(
+                    "copied file {} could not be re-read for byte comparison; \
+                         preserving the worktree",
+                    destination.display()
+                );
+            }
+        };
+        ensure!(
+            source_bytes == target_bytes,
+            "copied file {} is no longer byte-identical to its source; \
+             preserving the worktree",
+            destination.display()
+        );
+
+        planned.push(destination.clone());
+    }
+
+    for destination in planned {
+        fs::remove_file(&destination).with_context(|| {
+            format!(
+                "failed to remove copied file {} during rollback",
+                destination.display()
+            )
+        })?;
     }
     worktree_remove(repo_root, worktree_path, false)?;
     branch_delete(repo_root, branch, false)?;
     Ok(())
+}
+
+/// Whether `relative` inside `worktree_path` is tracked by git.
+fn is_tracked(worktree_path: &Path, relative: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["ls-files", "--"])
+        .arg(relative)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to run git ls-files in worktree {}",
+                worktree_path.display()
+            )
+        })?;
+    ensure!(
+        output.status.success(),
+        "git ls-files failed in {}: {}",
+        worktree_path.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
 /// Revalidate, immediately before removal, that the worktree at `path` is
@@ -1284,7 +1376,8 @@ mod tests {
                 .expect("eligibility")
         );
 
-        rollback_clean_creation(repo.path(), &wt, "feat-rollback", &[]).expect("rollback");
+        rollback_clean_creation(repo.path(), &wt, "feat-rollback", &base_sha, &[])
+            .expect("rollback");
         assert!(!wt.exists(), "worktree must be rolled back");
         assert!(
             !branch_exists(repo.path(), "feat-rollback"),
@@ -1304,7 +1397,10 @@ mod tests {
         ));
         worktree_add(repo.path(), "feat-copies", &wt).expect("worktree add");
         let wt = wt.canonicalize().expect("canonical worktree path");
-        let copied = vec![".env".to_owned()];
+        let copied = vec![CopiedFile {
+            source: repo.path().join(".env"),
+            destination: wt.join(".env"),
+        }];
 
         // Identical copy in the worktree stays eligible.
         fs::write(wt.join(".env"), "SECRET=1").expect("identical copy");
@@ -1322,7 +1418,8 @@ mod tests {
 
         // Rollback of the identical case removes the copy without force.
         fs::write(wt.join(".env"), "SECRET=1").expect("restore identical copy");
-        rollback_clean_creation(repo.path(), &wt, "feat-copies", &copied).expect("rollback");
+        rollback_clean_creation(repo.path(), &wt, "feat-copies", &base_sha, &copied)
+            .expect("rollback");
         assert!(!wt.exists());
         assert!(!branch_exists(repo.path(), "feat-copies"));
     }
