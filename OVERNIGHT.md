@@ -11,13 +11,26 @@
 - [x] 1. No implicit or escaping environment-file copies
 - [x] 2. Canonical in-repo worktree guard
 - [x] 3. Branch names and Git option safety
-- [ ] 4. Valid NDJSON for every control character
+- [x] 4. Valid NDJSON for every control character
 - [ ] 5. Branch/worktree ownership revalidation before removal
 - [ ] 6. Stale worktree metadata recovery
 - [ ] 7. Failed creation rollback
 - [ ] 8. Final adversarial audit + RESULT.md
 
-**Current milestone:** 4
+**Current milestone:** 5
+
+## Milestone 4 — complete (23:15 HKT)
+
+- `escape_json` now escapes every C0 control (serde_json-compatible policy: `\b \f \n \r \t`
+  short escapes, `\u00xx` for the rest). Emission refactored into `ndjson_lines(rows)` so tests can
+  validate the exact strings.
+- Converted `documents_defect_ndjson_skips_control_character_escaping` → regression covering the
+  full 0x00–0x1f range.
+- Added a test-only strict JSON parser (objects, strings, integers; rejects raw control bytes,
+  invalid escapes, malformed `\u`, trailing bytes) and a proof test that every emitted line for
+  control-heavy branch/path rows parses strictly and round-trips to the original values. No
+  runtime dependency added.
+- Gate: fmt PASS · bin 75/75 · cli 29/29 · clippy PASS.
 
 ## Milestone 3 — complete (23:08 HKT)
 
