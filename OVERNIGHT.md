@@ -8,7 +8,7 @@
 ## Milestone checklist
 
 - [x] 0. Linux offline verification path (disable unused git2 network features; prove offline suite)
-- [ ] 1. No implicit or escaping environment-file copies
+- [x] 1. No implicit or escaping environment-file copies
 - [ ] 2. Canonical in-repo worktree guard
 - [ ] 3. Branch names and Git option safety
 - [ ] 4. Valid NDJSON for every control character
@@ -17,7 +17,22 @@
 - [ ] 7. Failed creation rollback
 - [ ] 8. Final adversarial audit + RESULT.md
 
-**Current milestone:** 1
+**Current milestone:** 2
+
+## Milestone 1 — complete (22:55 HKT)
+
+- `files::env_sources` rewritten as a strict allowlist: empty list → zero side effects (no implicit
+  `.env*` discovery, no target mkdir); non-empty entries must be repository-relative regular files —
+  absolute paths, any `..` component, symlinks (final component), directories, and canonical-path
+  escapes via intermediate symlinks are all rejected with explicit errors. Missing entries still skip.
+- Destination behavior unchanged (flat `target/basename`).
+- Converted all 4 `documents_defect_copy_env_files_*` tests to regressions; added
+  `copy_pattern_escaping_repo_through_intermediate_symlink_is_rejected`.
+- Legacy unsafe unit tests flipped (`auto_discovers_root_env_files`, `creates_missing_target_dir`,
+  `skips_directories_named_env`, `unicode_env_suffix_is_copied`, strengthened `empty_repo_copies_nothing`).
+- e2e: `new_creates_worktree_and_query_prints_path` no longer expects the default `.env` copy; added
+  `new_without_copy_config_does_not_copy_env_files` and `new_copies_only_explicitly_configured_env_files`.
+- Gate: fmt PASS · clippy -D warnings PASS · bin 67/68 (only known milestone-2 red) · cli 27/27.
 
 ## Milestone 0 — complete (22:47 HKT)
 

@@ -218,9 +218,10 @@ fn new_creates_worktree_and_query_prints_path() {
     let path = stdout(&created).trim().to_owned();
     assert!(Path::new(&path).is_dir());
     assert!(Path::new(&path).join("README.md").exists());
-    assert_eq!(
-        fs::read_to_string(Path::new(&path).join(".env")).expect("copied env"),
-        "FAKECREDENTIAL=1"
+    // No [files] copy allowlist: credentials must stay in the source checkout.
+    assert!(
+        !Path::new(&path).join(".env").exists(),
+        "root .env must not be copied without an explicit files.copy entry"
     );
     assert!(
         !fx.repo.join(".gitignore").exists(),
@@ -247,6 +248,55 @@ fn new_creates_worktree_and_query_prints_path() {
         Path::new(&path)
             .canonicalize()
             .expect("canonicalize new path")
+    );
+}
+
+/// Regression: plain `lucus new` with no `[files]` configuration copies no
+/// environment files into the new worktree — not even a root `.env`.
+#[test]
+fn new_without_copy_config_does_not_copy_env_files() {
+    let fx = Fixture::new("new-no-copy");
+    fs::write(fx.repo.join(".env"), "FAKECREDENTIAL=1").expect("write .env");
+    fs::write(fx.repo.join(".env.local"), "FAKECREDENTIAL=2").expect("write .env.local");
+    fs::write(fx.repo.join(".envrc"), "FAKECREDENTIAL=3").expect("write .envrc");
+
+    let created = fx.lucus(&["new", "feat-no-copy"]);
+    assert_success(&created);
+    let path = stdout(&created).trim().to_owned();
+
+    assert!(
+        !Path::new(&path).join(".env").exists(),
+        ".env must not be copied"
+    );
+    assert!(
+        !Path::new(&path).join(".env.local").exists(),
+        ".env.local must not be copied"
+    );
+    assert!(
+        !Path::new(&path).join(".envrc").exists(),
+        ".envrc must not be copied"
+    );
+}
+
+/// The explicit allowlist copies exactly the configured files and nothing else.
+#[test]
+fn new_copies_only_explicitly_configured_env_files() {
+    let fx = Fixture::new("new-copy-allowlist");
+    fs::write(fx.repo.join(".env"), "FAKECREDENTIAL=1").expect("write .env");
+    fs::write(fx.repo.join(".envrc"), "FAKECREDENTIAL=2").expect("write .envrc");
+    fx.write_config("[files]\ncopy = [\".env\"]\n");
+
+    let created = fx.lucus(&["new", "feat-copy-allowlist"]);
+    assert_success(&created);
+    let path = stdout(&created).trim().to_owned();
+
+    assert_eq!(
+        fs::read_to_string(Path::new(&path).join(".env")).expect("listed .env should be copied"),
+        "FAKECREDENTIAL=1"
+    );
+    assert!(
+        !Path::new(&path).join(".envrc").exists(),
+        "unlisted files must not be copied"
     );
 }
 

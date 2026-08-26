@@ -1,9 +1,13 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 pub fn copy_env_files(repo_root: &Path, target_path: &Path, patterns: &[String]) -> Result<()> {
     let sources = env_sources(repo_root, patterns)?;
+    if sources.is_empty() {
+        return Ok(());
+    }
+
     fs::create_dir_all(target_path).with_context(|| {
         format!(
             "failed to create target directory {}",
@@ -88,36 +92,64 @@ pub fn ensure_gitignore(repo_root: &Path, target_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolve `files.copy` entries to copyable sources.
+///
+/// The list is an explicit allowlist of regular files inside the repository.
+/// An empty list copies nothing: there is no implicit `.env*` discovery.
+/// Every entry must be repository-relative and is rejected when it is
+/// absolute, contains `..`, names a directory, is a symlink, or resolves
+/// (canonically, through any intermediate symlink) outside the repository.
 fn env_sources(repo_root: &Path, patterns: &[String]) -> Result<Vec<PathBuf>> {
     if patterns.is_empty() {
-        let mut discovered = Vec::new();
-        for entry in fs::read_dir(repo_root)
-            .with_context(|| format!("failed to read directory {}", repo_root.display()))?
-        {
-            let entry =
-                entry.with_context(|| format!("failed to inspect {}", repo_root.display()))?;
-            let file_type = entry
-                .file_type()
-                .with_context(|| format!("failed to read type for {}", entry.path().display()))?;
-            if !file_type.is_file() {
-                continue;
-            }
+        return Ok(Vec::new());
+    }
 
-            let file_name = entry.file_name();
-            let file_name = file_name.to_string_lossy();
-            if file_name.starts_with(".env") {
-                discovered.push(entry.path());
+    let repo_canonical = repo_root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize repo root {}", repo_root.display()))?;
+
+    let mut sources = Vec::new();
+    for pattern in patterns {
+        let relative = Path::new(pattern);
+        ensure!(
+            !relative.is_absolute(),
+            "files.copy entry '{pattern}' must be relative to the repository root"
+        );
+        ensure!(
+            !relative
+                .components()
+                .any(|c| matches!(c, Component::ParentDir)),
+            "files.copy entry '{pattern}' must not contain '..'"
+        );
+
+        let candidate = repo_root.join(relative);
+        match fs::symlink_metadata(&candidate) {
+            // Missing entries are skipped; the allowlist may list
+            // machine-specific optional files.
+            Err(_) => continue,
+            Ok(metadata) => {
+                ensure!(
+                    !metadata.file_type().is_symlink(),
+                    "files.copy entry '{pattern}' is a symlink; refusing to copy through symlinks"
+                );
+                ensure!(
+                    !metadata.is_dir(),
+                    "files.copy entry '{pattern}' is a directory; only regular files can be copied"
+                );
             }
         }
 
-        discovered.sort();
-        return Ok(discovered);
-    }
+        let canonical = candidate
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize files.copy entry '{pattern}'"))?;
+        ensure!(
+            canonical.starts_with(&repo_canonical),
+            "files.copy entry '{pattern}' resolves outside the repository"
+        );
 
-    Ok(patterns
-        .iter()
-        .map(|pattern| repo_root.join(pattern))
-        .collect())
+        sources.push(candidate);
+    }
+    Ok(sources)
 }
 
 fn normalize_path(path: &Path, base: &Path) -> PathBuf {
@@ -206,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_env_files_auto_discovers_root_env_files() {
+    fn copy_env_files_copies_only_explicitly_listed_files() {
         let root = TestDir::new("repo");
         let target = root.path().join("worktree");
         fs::create_dir_all(&target).expect("worktree dir should exist");
@@ -215,7 +247,12 @@ mod tests {
         fs::write(root.path().join(".env.local"), "LOCAL=1").expect("should write .env.local");
         fs::write(root.path().join("README.md"), "ignore").expect("should write readme");
 
-        copy_env_files(root.path(), &target, &[]).expect("copy should succeed");
+        copy_env_files(
+            root.path(),
+            &target,
+            &[".env".to_owned(), ".env.local".to_owned()],
+        )
+        .expect("copy should succeed");
 
         assert_eq!(
             fs::read_to_string(target.join(".env")).expect("copied .env should exist"),
@@ -227,7 +264,7 @@ mod tests {
         );
         assert!(
             !target.join("README.md").exists(),
-            "non-env files should not be copied"
+            "files outside the allowlist should not be copied"
         );
     }
 
@@ -288,22 +325,33 @@ mod tests {
     }
 
     #[test]
-    fn copy_env_files_creates_missing_target_dir() {
+    fn copy_env_files_creates_missing_target_dir_for_explicit_entries() {
         let root = TestDir::new("repo-mkdir");
+        fs::write(root.path().join(".env"), "ROOT=1").expect("should write .env");
         let target = root.path().join("missing").join("worktree");
-        copy_env_files(root.path(), &target, &[]).expect("copy should succeed");
+        copy_env_files(root.path(), &target, &[".env".to_owned()]).expect("copy should succeed");
         assert!(target.is_dir());
+        assert!(target.join(".env").exists());
     }
 
     #[test]
-    fn copy_env_files_skips_directories_named_env() {
+    fn copy_env_files_rejects_directory_entry() {
         let root = TestDir::new("repo-env-dir");
         let target = root.path().join("worktree");
-        fs::create_dir_all(root.path().join(".env")).expect("dir .env should exist");
-        copy_env_files(root.path(), &target, &[".env".to_owned()]).expect("copy should succeed");
+        fs::create_dir_all(root.path().join("conf")).expect("directory entry should exist");
+        fs::create_dir_all(&target).expect("worktree dir should exist");
+        let err = copy_env_files(root.path(), &target, &["conf".to_owned()])
+            .expect_err("directory entries should be rejected");
         assert!(
-            !target.join(".env").exists(),
-            "directory sources should be skipped"
+            err.to_string().contains("is a directory"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            fs::read_dir(&target)
+                .expect("target readable")
+                .next()
+                .is_none(),
+            "rejected entries must not be copied"
         );
     }
 
@@ -312,18 +360,19 @@ mod tests {
         let root = TestDir::new("repo-empty");
         let target = root.path().join("worktree");
         copy_env_files(root.path(), &target, &[]).expect("copy should succeed");
-        let entries: Vec<_> = fs::read_dir(&target)
-            .expect("target should exist")
-            .collect();
-        assert!(entries.is_empty(), "no env files should be copied");
+        assert!(
+            !target.exists(),
+            "empty allowlist should have no filesystem side effects"
+        );
     }
 
     #[test]
-    fn copy_env_files_unicode_env_suffix_is_copied() {
+    fn copy_env_files_unicode_entry_is_copied() {
         let root = TestDir::new("repo-unicode");
         let target = root.path().join("worktree");
         fs::write(root.path().join(".env.ünicode"), "OK=1").expect("should write unicode env");
-        copy_env_files(root.path(), &target, &[]).expect("copy should succeed");
+        copy_env_files(root.path(), &target, &[".env.ünicode".to_owned()])
+            .expect("copy should succeed");
         assert_eq!(
             fs::read_to_string(target.join(".env.ünicode")).expect("copied file should exist"),
             "OK=1"
@@ -344,14 +393,12 @@ mod tests {
         assert_eq!(gitignore, "target\nworktrees/\n");
     }
 
-    /// Expected: with an empty `files.copy` list, creation copies no files and
-    /// never auto-discovers `.env*` (including `.envrc`), so credentials stay
-    /// in the source checkout.
-    /// Observed: empty patterns scan the repo root and copy every filename
-    /// that starts with `.env`, including `.envrc`.
+    /// Regression: with an empty `files.copy` list, creation copies no files
+    /// and never auto-discovers `.env*` (including `.envrc`), so credentials
+    /// stay in the source checkout unless explicitly configured.
     #[test]
-    fn documents_defect_copy_env_files_auto_discovers_when_unconfigured() {
-        let root = TestDir::new("repo-autodiscover-defect");
+    fn empty_copy_list_copies_nothing_and_never_discovers_env_files() {
+        let root = TestDir::new("repo-autodiscover-regression");
         let target = root.path().join("worktree");
         fs::create_dir_all(&target).expect("worktree dir should exist");
         fs::write(root.path().join(".env"), "FAKECREDENTIAL=1").expect("should write .env");
@@ -359,22 +406,21 @@ mod tests {
 
         copy_env_files(root.path(), &target, &[]).expect("copy should succeed");
 
-        assert_eq!(
-            fs::read_to_string(target.join(".env")).expect("copied .env should exist"),
-            "FAKECREDENTIAL=1"
+        assert!(
+            !target.join(".env").exists(),
+            ".env must not be copied implicitly"
         );
-        assert_eq!(
-            fs::read_to_string(target.join(".envrc")).expect("copied .envrc should exist"),
-            "FAKECREDENTIAL=2"
+        assert!(
+            !target.join(".envrc").exists(),
+            ".envrc must not be copied implicitly"
         );
+        assert!(fs::read_dir(&target).unwrap().next().is_none());
     }
 
-    /// Expected: `files.copy` entries are resolved relative to the repo root
-    /// and rejected if they escape it.
-    /// Observed: an absolute pattern replaces the repo root via `Path::join`
-    /// and the file is copied into the worktree.
+    /// Regression: `files.copy` entries are repository-relative only;
+    /// absolute paths are rejected instead of replacing the repo root.
     #[test]
-    fn documents_defect_copy_env_files_absolute_pattern_escapes_repo() {
+    fn absolute_copy_pattern_is_rejected() {
         let root = TestDir::new("repo-abs-pattern");
         let outside = TestDir::new("outside-abs-pattern");
         let target = root.path().join("worktree");
@@ -382,24 +428,24 @@ mod tests {
         let leaked = outside.path().join("leaked.env");
         fs::write(&leaked, "FAKECREDENTIAL=1").expect("should write outside file");
 
-        copy_env_files(
+        let err = copy_env_files(
             root.path(),
             &target,
             &[leaked.to_string_lossy().into_owned()],
         )
-        .expect("copy currently succeeds");
+        .expect_err("absolute entries should be rejected");
 
-        assert_eq!(
-            fs::read_to_string(target.join("leaked.env")).expect("escaped file should be copied"),
-            "FAKECREDENTIAL=1"
+        assert!(
+            err.to_string().contains("relative to the repository root"),
+            "unexpected error: {err:#}"
         );
+        assert!(!target.join("leaked.env").exists());
     }
 
-    /// Expected: `../` components in a copy pattern cannot reach files outside
-    /// the repository.
-    /// Observed: `repo_root.join("../secret.env")` is copied unchanged.
+    /// Regression: `../` components in a copy pattern are rejected, so they
+    /// cannot reach files outside the repository.
     #[test]
-    fn documents_defect_copy_env_files_parent_pattern_escapes_repo() {
+    fn parent_traversal_copy_pattern_is_rejected() {
         let workspace = TestDir::new("workspace-parent-pattern");
         let repo = workspace.path().join("repo");
         fs::create_dir_all(&repo).expect("repo should exist");
@@ -408,21 +454,20 @@ mod tests {
         fs::write(workspace.path().join("secret.env"), "FAKECREDENTIAL=1")
             .expect("should write sibling secret");
 
-        copy_env_files(&repo, &target, &["../secret.env".to_owned()])
-            .expect("copy currently succeeds");
+        let err = copy_env_files(&repo, &target, &["../secret.env".to_owned()])
+            .expect_err("parent traversal should be rejected");
 
-        assert_eq!(
-            fs::read_to_string(target.join("secret.env")).expect("escaped file should be copied"),
-            "FAKECREDENTIAL=1"
+        assert!(
+            err.to_string().contains("must not contain '..'"),
+            "unexpected error: {err:#}"
         );
+        assert!(!target.join("secret.env").exists());
     }
 
-    /// Expected: copy sources that are symlinks are refused, especially when
-    /// they point outside the repository.
-    /// Observed: pattern mode uses `Path::is_file()`, which follows the
-    /// symlink and copies the target's contents.
+    /// Regression: copy sources that are symlinks are refused, including
+    /// symlinks pointing outside the repository.
     #[test]
-    fn documents_defect_copy_env_files_follows_symlink_in_pattern_mode() {
+    fn symlink_copy_pattern_is_rejected() {
         let root = TestDir::new("repo-symlink");
         let outside = TestDir::new("outside-symlink");
         let target = root.path().join("worktree");
@@ -432,12 +477,37 @@ mod tests {
         std::os::unix::fs::symlink(&leaked, root.path().join(".env"))
             .expect("symlink should exist");
 
-        copy_env_files(root.path(), &target, &[".env".to_owned()])
-            .expect("copy currently succeeds");
+        let err = copy_env_files(root.path(), &target, &[".env".to_owned()])
+            .expect_err("symlink entries should be rejected");
 
-        assert_eq!(
-            fs::read_to_string(target.join(".env")).expect("symlink target should be copied"),
-            "FAKECREDENTIAL=1"
+        assert!(
+            err.to_string().contains("is a symlink"),
+            "unexpected error: {err:#}"
         );
+        assert!(!target.join(".env").exists());
+    }
+
+    /// Regression: an entry is rejected when its canonical path escapes the
+    /// repository through an intermediate symlinked directory, even though
+    /// the final component is a regular file.
+    #[test]
+    fn copy_pattern_escaping_repo_through_intermediate_symlink_is_rejected() {
+        let root = TestDir::new("repo-inter-symlink");
+        let outside = TestDir::new("outside-inter-symlink");
+        let target = root.path().join("worktree");
+        fs::create_dir_all(&target).expect("worktree dir should exist");
+        let leaked = outside.path().join("leaked.env");
+        fs::write(&leaked, "FAKECREDENTIAL=1").expect("should write outside file");
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link"))
+            .expect("symlinked directory should exist");
+
+        let err = copy_env_files(root.path(), &target, &["link/leaked.env".to_owned()])
+            .expect_err("escaping entries should be rejected");
+
+        assert!(
+            err.to_string().contains("resolves outside the repository"),
+            "unexpected error: {err:#}"
+        );
+        assert!(!target.join("leaked.env").exists());
     }
 }
