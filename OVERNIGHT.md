@@ -14,10 +14,30 @@
 - [x] 4. Valid NDJSON for every control character
 - [x] 5. Branch/worktree ownership revalidation before removal
 - [x] 6. Stale worktree metadata recovery
-- [ ] 7. Failed creation rollback
+- [x] 7. Failed creation rollback
 - [ ] 8. Final adversarial audit + RESULT.md
 
-**Current milestone:** 7
+**Current milestone:** 8
+
+## Milestone 7 — complete (23:47 HKT)
+
+- `new` captures the base SHA before `git worktree add`; copy/`ensure_gitignore`/hooks moved into
+  `finalize_creation`. On failure, `git::creation_is_rollback_eligible` deterministically decides:
+  worktree still registered+attached to the branch, branch tip == base SHA, and every dirty/untracked
+  path is a lucus-copied file still byte-identical to its source in the main checkout. Eligible →
+  `git::rollback_clean_creation` removes only the identical copies, then non-force
+  `worktree remove` + `branch -d`. Ineligible (hook commit, hook edit, hook file, moved worktree) →
+  everything preserved with exact recovery steps naming `lucus remove <branch>`. Force never used.
+- New helpers: `rev_parse` (with `--`), `dirty_paths` (porcelain parser), `branch_exists`, plus the
+  two rollback functions above.
+- Unit regressions: pristine rollback (no force), identical-vs-diverged copies, advanced branch,
+  extra untracked file.
+- e2e regressions: copy failure midway (chmod 000 second entry; first copy cleaned), invalid copy
+  entry (directory), clean hook failure (`["false"]`), hook-commit preservation, hook-untracked-file
+  preservation — each asserting rollback or preservation plus branch state.
+- Note: `ensure_gitignore` no-ops for `new` paths since milestone 2 guarantees outside-repo targets,
+  so no `.gitignore` rollback is needed.
+- Gate: fmt PASS · bin 84/84 · cli 39/39 · clippy PASS.
 
 ## Milestone 6 — complete (23:34 HKT)
 

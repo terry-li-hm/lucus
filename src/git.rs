@@ -175,6 +175,131 @@ pub fn prune_stale_worktrees(repo_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Read a commit id (or any revision) via `git rev-parse --verify`.
+pub fn rev_parse(repo_root: &Path, revision: &str) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--verify"])
+        .arg(revision)
+        .output()
+        .with_context(|| format!("failed to execute git rev-parse for {revision}"))?;
+
+    ensure!(
+        output.status.success(),
+        "git rev-parse failed for {revision}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    ensure!(
+        !value.is_empty(),
+        "git rev-parse returned nothing for {revision}"
+    );
+    Ok(value)
+}
+
+/// Paths reported dirty or untracked by `git status --porcelain`.
+pub fn dirty_paths(worktree_path: &Path) -> Result<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(worktree_path)
+        .args(["status", "--porcelain"])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to read git status for worktree {}",
+                worktree_path.display()
+            )
+        })?;
+
+    ensure!(
+        output.status.success(),
+        "git status failed for worktree {}",
+        worktree_path.display()
+    );
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let rest = line.get(3..)?;
+            let path = rest.split(" -> ").next()?;
+            Some(path.trim().to_owned())
+        })
+        .collect())
+}
+
+/// Deterministically decide whether a just-created worktree can be rolled
+/// back after a creation step failed.
+///
+/// Eligible only when every check proves there is no unique state:
+/// the worktree is still registered for and attached to `branch`, the branch
+/// still points at `base_sha` (the commit the worktree was created from),
+/// and every file differing from the checkout is one of the copies lucus
+/// made (`copied`) and is still byte-identical to its source in the main
+/// checkout (`repo_root`).
+pub fn creation_is_rollback_eligible(
+    repo_root: &Path,
+    worktree_path: &Path,
+    branch: &str,
+    base_sha: &str,
+    copied: &[String],
+) -> Result<bool> {
+    if ensure_worktree_attached_to_branch(repo_root, worktree_path, branch).is_err() {
+        return Ok(false);
+    }
+    let tip = match rev_parse(repo_root, &format!("refs/heads/{branch}")) {
+        Ok(tip) => tip,
+        Err(_) => return Ok(false),
+    };
+    if tip != base_sha {
+        return Ok(false);
+    }
+
+    for path in dirty_paths(worktree_path)? {
+        // Only files lucus itself copied may differ, and only while still
+        // byte-identical to their source in the main checkout.
+        let Some(name) = Path::new(&path).file_name().and_then(|n| n.to_str()) else {
+            return Ok(false);
+        };
+        if !copied.iter().any(|copied| copied == name) {
+            return Ok(false);
+        }
+        let source = repo_root.join(name);
+        let target = worktree_path.join(name);
+        match (fs::read(&source), fs::read(&target)) {
+            (Ok(source_bytes), Ok(target_bytes)) if source_bytes == target_bytes => {}
+            _ => return Ok(false),
+        }
+    }
+
+    Ok(true)
+}
+
+/// Roll back a rollback-eligible creation without force: remove only the
+/// byte-identical copies lucus made, then remove the worktree and delete the
+/// branch with ordinary merged-state protection.
+pub fn rollback_clean_creation(
+    repo_root: &Path,
+    worktree_path: &Path,
+    branch: &str,
+    copied: &[String],
+) -> Result<()> {
+    for name in copied {
+        let target = worktree_path.join(name);
+        if target.exists() {
+            fs::remove_file(&target).with_context(|| {
+                format!(
+                    "failed to remove copied file {} during rollback",
+                    target.display()
+                )
+            })?;
+        }
+    }
+    worktree_remove(repo_root, worktree_path, false)?;
+    branch_delete(repo_root, branch, false)?;
+    Ok(())
+}
+
 /// Revalidate, immediately before removal, that the worktree at `path` is
 /// still registered for `branch` and that its HEAD still points at `branch`.
 ///
@@ -1141,5 +1266,96 @@ mod tests {
 
         branch_delete(repo.path(), "unique", true).expect("force delete unmerged branch");
         assert!(!branch_exists(repo.path(), "unique"));
+    }
+    #[test]
+    fn pristine_creation_is_rollback_eligible_and_rolls_back_without_force() {
+        let repo = init_repo("rollback-clean");
+        let base_sha = rev_parse(repo.path(), "HEAD").expect("base sha");
+        let wt = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-rollback-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-rollback", &wt).expect("worktree add");
+        let wt = wt.canonicalize().expect("canonical worktree path");
+
+        assert!(
+            creation_is_rollback_eligible(repo.path(), &wt, "feat-rollback", &base_sha, &[])
+                .expect("eligibility")
+        );
+
+        rollback_clean_creation(repo.path(), &wt, "feat-rollback", &[]).expect("rollback");
+        assert!(!wt.exists(), "worktree must be rolled back");
+        assert!(
+            !branch_exists(repo.path(), "feat-rollback"),
+            "branch must be rolled back"
+        );
+    }
+
+    #[test]
+    fn rollback_eligibility_survives_identical_copies_but_not_divergence() {
+        let repo = init_repo("rollback-copies");
+        let base_sha = rev_parse(repo.path(), "HEAD").expect("base sha");
+        fs::write(repo.path().join(".env"), "SECRET=1").expect("source .env");
+        let wt = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-copies-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-copies", &wt).expect("worktree add");
+        let wt = wt.canonicalize().expect("canonical worktree path");
+        let copied = vec![".env".to_owned()];
+
+        // Identical copy in the worktree stays eligible.
+        fs::write(wt.join(".env"), "SECRET=1").expect("identical copy");
+        assert!(
+            creation_is_rollback_eligible(repo.path(), &wt, "feat-copies", &base_sha, &copied)
+                .expect("eligibility")
+        );
+
+        // A modified copy (a hook may have rewritten it) is unique state.
+        fs::write(wt.join(".env"), "SECRET=2").expect("diverged copy");
+        assert!(
+            !creation_is_rollback_eligible(repo.path(), &wt, "feat-copies", &base_sha, &copied)
+                .expect("eligibility")
+        );
+
+        // Rollback of the identical case removes the copy without force.
+        fs::write(wt.join(".env"), "SECRET=1").expect("restore identical copy");
+        rollback_clean_creation(repo.path(), &wt, "feat-copies", &copied).expect("rollback");
+        assert!(!wt.exists());
+        assert!(!branch_exists(repo.path(), "feat-copies"));
+    }
+
+    #[test]
+    fn rollback_eligibility_refuses_advanced_branch_and_extra_files() {
+        let repo = init_repo("rollback-unique");
+        let base_sha = rev_parse(repo.path(), "HEAD").expect("base sha");
+        let wt = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-unique-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-unique-state", &wt).expect("worktree add");
+        let wt = wt.canonicalize().expect("canonical worktree path");
+
+        // A hook that committed advanced the branch: unique state.
+        git(&wt, &["commit", "--allow-empty", "-m", "hook work"]);
+        assert!(
+            !creation_is_rollback_eligible(repo.path(), &wt, "feat-unique-state", &base_sha, &[])
+                .expect("eligibility")
+        );
+        git(&wt, &["reset", "--hard", "HEAD~1"]);
+
+        // A hook that left an untracked file: unique state.
+        fs::write(wt.join("leftover.txt"), "x").expect("leftover file");
+        assert!(
+            !creation_is_rollback_eligible(repo.path(), &wt, "feat-unique-state", &base_sha, &[])
+                .expect("eligibility")
+        );
+        fs::remove_file(wt.join("leftover.txt")).expect("remove leftover");
+
+        worktree_remove(repo.path(), &wt, true).expect("cleanup");
+        branch_delete(repo.path(), "feat-unique-state", true).expect("cleanup branch");
     }
 }

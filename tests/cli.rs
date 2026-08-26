@@ -709,6 +709,150 @@ fn stale_worktree_recovery_refuses_to_delete_unmerged_branch() {
     assert!(!branch_exists(&fx, "feat-stale-unique"));
 }
 
+/// Regression: a copy failure midway through copying (first file copied,
+/// second unreadable) rolls back the freshly created clean worktree and
+/// branch without force; the already-copied file is removed as part of it.
+#[test]
+fn new_rolls_back_when_copy_fails_midway() {
+    let fx = Fixture::new("rollback-copy-midway");
+    fs::write(fx.repo.join(".env"), "FAKECREDENTIAL=1").expect("write .env");
+    fs::write(fx.repo.join("locked.env"), "FAKECREDENTIAL=2").expect("write locked.env");
+    fs::set_permissions(
+        fx.repo.join("locked.env"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .expect("lock file");
+    fx.write_config("[files]\ncopy = [\".env\", \"locked.env\"]\n");
+
+    let output = fx.lucus(&["new", "feat-copy-fail"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    assert!(
+        stderr(&output).contains("failed to copy env file"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("rolled back"),
+        "rollback must be reported: {}",
+        stderr(&output)
+    );
+    let path = fx.root.join("repo.feat-copy-fail");
+    assert!(!path.exists(), "worktree must be rolled back");
+    assert!(
+        !branch_exists(&fx, "feat-copy-fail"),
+        "branch must be rolled back"
+    );
+
+    fs::set_permissions(
+        fx.repo.join("locked.env"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .expect("unlock for fixture cleanup");
+}
+
+/// Regression: an invalid copy entry (a directory) fails creation and rolls
+/// everything back.
+#[test]
+fn new_rolls_back_when_copy_entry_is_invalid() {
+    let fx = Fixture::new("rollback-copy-invalid");
+    fs::create_dir_all(fx.repo.join("notes")).expect("directory entry");
+    fx.write_config("[files]\ncopy = [\"notes\"]\n");
+
+    let output = fx.lucus(&["new", "feat-copy-invalid"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    assert!(
+        stderr(&output).contains("is a directory"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("rolled back"));
+    assert!(!fx.root.join("repo.feat-copy-invalid").exists());
+    assert!(!branch_exists(&fx, "feat-copy-invalid"));
+}
+
+/// Regression: a failing post_create hook rolls back the clean worktree and
+/// branch (never with force).
+#[test]
+fn new_rolls_back_when_post_create_hook_fails_cleanly() {
+    let fx = Fixture::new("rollback-hook");
+    fx.write_config("[hooks]\npost_create = [\"false\"]\n");
+
+    let output = fx.lucus(&["new", "feat-hook-clean"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    assert!(
+        stderr(&output).contains("hook command failed"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    assert!(stderr(&output).contains("rolled back"));
+    assert!(!fx.root.join("repo.feat-hook-clean").exists());
+    assert!(!branch_exists(&fx, "feat-hook-clean"));
+}
+
+/// Regression: a hook that commits before failing creates unique state —
+/// the worktree and branch are preserved with recovery instructions.
+#[test]
+fn new_preserves_worktree_when_hook_makes_commit() {
+    let fx = Fixture::new("preserve-hook-commit");
+    fx.write_config(
+        "[hooks]\npost_create = ['git -C \"$LUCUS_WORKTREE_PATH\" commit --allow-empty -m hook', 'false']\n",
+    );
+
+    let output = fx.lucus(&["new", "feat-hook-commit"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    assert!(
+        stderr(&output).contains("may contain unique state"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("lucus remove feat-hook-commit"),
+        "recovery steps must name the exact command: {}",
+        stderr(&output)
+    );
+    let path = fx.root.join("repo.feat-hook-commit");
+    assert!(path.is_dir(), "worktree must be preserved");
+    assert!(
+        branch_exists(&fx, "feat-hook-commit"),
+        "branch must be preserved"
+    );
+
+    // The hook's commit is intact and the removal path still works.
+    git(&path, &fx.root, &["log", "-1", "--oneline"]);
+    let removed = fx.lucus(&["remove", "--force", "feat-hook-commit"]);
+    assert_success(&removed);
+}
+
+/// Regression: a hook that leaves untracked files before failing creates
+/// unique state — everything is preserved with recovery instructions.
+#[test]
+fn new_preserves_worktree_when_hook_leaves_untracked_file() {
+    let fx = Fixture::new("preserve-hook-untracked");
+    fx.write_config(
+        "[hooks]\npost_create = ['touch \"$LUCUS_WORKTREE_PATH/leftover.txt\"', 'false']\n",
+    );
+
+    let output = fx.lucus(&["new", "feat-hook-leftover"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    assert!(
+        stderr(&output).contains("may contain unique state"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    let path = fx.root.join("repo.feat-hook-leftover");
+    assert!(path.is_dir(), "worktree must be preserved");
+    assert!(path.join("leftover.txt").exists(), "hook file must survive");
+    assert!(branch_exists(&fx, "feat-hook-leftover"));
+
+    let removed = fx.lucus(&["remove", "--force", "feat-hook-leftover"]);
+    assert_success(&removed);
+}
+
 #[test]
 fn init_zsh_writes_wrapper_under_isolated_home() {
     let fx = Fixture::new("init");
