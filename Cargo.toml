@@ -12,7 +12,9 @@ categories = ["command-line-utilities", "development-tools"]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 directories = "5"
-git2 = "0.20"
+# Network transports are disabled: lucus uses git2 only for local
+# repository discovery, open, worktree listing, and HEAD resolution.
+git2 = { version = "0.20", default-features = false }
 indicatif = "0.17"
 owo-colors = "4"
 rayon = "1"
