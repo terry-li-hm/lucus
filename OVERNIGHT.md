@@ -183,5 +183,27 @@ All 8 defect-documenting tests converted to regressions; 123 tests green offline
   HEAD; every predicate→test→commit mapping is in RESULT.md; unresolved risks and Linux
   verification needs are listed there. No pushes, no PRs, no history rewrites.
 
+### GOAL RESTART VERIFICATION — 2026-08-26 15:20 UTC (23:20 HKT)
+
+Resumed from the pause record above under the reloaded goal. No milestone remained; performed a
+second adversarial sweep of the audit's borderline items instead of manufacturing work:
+
+- `lucus new HEAD` (branch literally named `HEAD`): probed in a scratch repo — git itself refuses
+  `worktree add -b HEAD` ("not a valid branch name"), so creation fails before any state exists.
+  The destructive conflation path (`remove HEAD` matching a detached worktree listed as `HEAD`)
+  is independently refused by the M5 revalidation (`head.is_branch()` false), covered by
+  `ensure_worktree_attached_rejects_detached_head`. No defect.
+- `dirty_paths` porcelain parsing (quoted paths, `R old -> new` renames, `?? dir/` untracked
+  dirs): every non-trivial shape fails to match a copied basename → rollback eligibility refuses →
+  state preserved. Parser errs safe. No defect.
+- Nested copy entries (`conf/.env` copied flat as `.env`): byte-identity check reads the wrong
+  source path → eligibility refuses → worktree preserved (conservative, never destructive).
+  Acceptable limitation, noted.
+- `init.rs` rc-file write follows symlinks under `$HOME`: standard editor semantics in the user's
+  own home, not a worktree-lifecycle boundary; out of causal scope for this contract.
+
+Final gates re-run at 15:19 UTC: fmt PASS · bin 84/84 · cli 39/39 · clippy -D warnings PASS ·
+`git diff --check` PASS · 10 commits, base `d1eb5af` unchanged. **Campaign complete.**
+
 If this session dies: re-read this file, then CONTRACT.md. Each completed milestone is one
 local commit on this lane; do not rewrite them. Work only inside this worktree.
