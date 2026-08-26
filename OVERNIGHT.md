@@ -169,5 +169,19 @@ All 8 defect-documenting tests converted to regressions; 123 tests green offline
 
 ## Recovery notes
 
+### PAUSED FOR GOAL RESTART — 2026-08-26 15:17 UTC (23:17 HKT)
+
+- **State:** all 8 milestones complete. No edit in flight; pause taken at the final atomic
+  boundary. **Next milestone: none** — do not start new work without a new contract/extension.
+- **HEAD:** `0594024` (docs: record overnight completion map in RESULT.md); 9 commits total on
+  `lane/lucus-safety-overnight-local`, base `d1eb5af` = `origin/main`.
+- **Gates re-verified at pause:** fmt PASS · bin 84/84 · cli 39/39 · clippy -D warnings PASS ·
+  `git diff --check` PASS. Deadline (23:00 UTC) not reached — ~7.7h remaining.
+- **Untracked (intentionally not committed):** `CONTRACT.md` (the contract itself), `.pi/`
+  (session artifacts). Neither is contract-editable.
+- **For a continuation session:** re-read CONTRACT.md + this file + RESULT.md; verify base and
+  HEAD; every predicate→test→commit mapping is in RESULT.md; unresolved risks and Linux
+  verification needs are listed there. No pushes, no PRs, no history rewrites.
+
 If this session dies: re-read this file, then CONTRACT.md. Each completed milestone is one
 local commit on this lane; do not rewrite them. Work only inside this worktree.
