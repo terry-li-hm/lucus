@@ -10,14 +10,30 @@
 - [x] 0. Linux offline verification path (disable unused git2 network features; prove offline suite)
 - [x] 1. No implicit or escaping environment-file copies
 - [x] 2. Canonical in-repo worktree guard
-- [ ] 3. Branch names and Git option safety
+- [x] 3. Branch names and Git option safety
 - [ ] 4. Valid NDJSON for every control character
 - [ ] 5. Branch/worktree ownership revalidation before removal
 - [ ] 6. Stale worktree metadata recovery
 - [ ] 7. Failed creation rollback
 - [ ] 8. Final adversarial audit + RESULT.md
 
-**Current milestone:** 3
+**Current milestone:** 4
+
+## Milestone 3 — complete (23:08 HKT)
+
+- `sanitize_branch` (silent rewrite) replaced by `validate_branch_name` (identity-preserving,
+  explicit rejection): charset `[A-Za-z0-9/._-]`; rejects leading `-` (option injection), leading
+  `.`/`/`, `..` traversal, `//`, dot-leading components, trailing `/`/`.`/`.lock`, >60 chars.
+  Dots preserved: `release/1.2.3` created unchanged (was `release/123`); no silent truncation
+  collapse. `resolve_worktree_path` re-validates as defense in depth. `--` separators added to
+  `git worktree add`, `git worktree remove`, and `git branch -d/-D` (verified accepted in a scratch
+  repo first).
+- Converted both `documents_defect_sanitize_*` tests into regressions; rewrote the strip-semantics
+  unit tests as rejection tests; added `branch_delete_removes_dotted_branch_after_dashdash_separator`.
+- e2e: `new_rejects_branch_name_with_invalid_characters`, `new_rejects_unicode_branch_name`,
+  `new_preserves_dotted_branch_names` (also proves remove/query of dotted names),
+  `new_rejects_leading_dash_branch_name` (via `--` passthrough).
+- Gate: fmt PASS · bin 72/72 · cli 29/29 · clippy PASS · `git diff --check` clean.
 
 ## Milestone 2 — complete (23:01 HKT)
 

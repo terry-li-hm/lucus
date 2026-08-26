@@ -310,23 +310,72 @@ fn new_duplicate_branch_fails() {
     assert!(stderr(&output).contains("worktree already exists"));
 }
 
+/// Regression: names made only of invalid characters are rejected up front
+/// with an explicit error instead of silently "sanitizing to empty".
 #[test]
-fn new_rejects_branch_that_sanitizes_to_empty() {
-    let fx = Fixture::new("new-empty");
+fn new_rejects_branch_name_with_invalid_characters() {
+    let fx = Fixture::new("new-invalid");
     let output = fx.lucus(&["new", "!!!"]);
     let code = assert_failure(&output);
     assert_eq!(code, 1);
-    assert!(stderr(&output).contains("empty after sanitization"));
+    assert!(
+        stderr(&output).contains("characters not allowed"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
 }
 
 #[test]
-fn new_unicode_branch_is_stripped() {
+fn new_rejects_unicode_branch_name() {
     let fx = Fixture::new("new-unicode");
     let output = fx.lucus(&["new", "feat/你好"]);
-    // Sanitizes to "feat/", which git typically rejects.
     let code = assert_failure(&output);
     assert_eq!(code, 1);
-    assert!(stderr(&output).contains("lucus:"));
+    assert!(
+        stderr(&output).contains("characters not allowed"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+}
+
+/// Regression: `release/1.2.3` used to collapse to `release/123`; valid
+/// dotted names are now created unchanged.
+#[test]
+fn new_preserves_dotted_branch_names() {
+    let fx = Fixture::new("new-dotted");
+    let created = fx.lucus(&["new", "release/1.2.3"]);
+    assert_success(&created);
+    let path = stdout(&created).trim().to_owned();
+    assert!(Path::new(&path).is_dir());
+    assert!(branch_exists(&fx, "release/1.2.3"));
+    // The collapsed variant must not exist as a side effect.
+    assert!(!branch_exists(&fx, "release/123"));
+
+    let queried = fx.lucus(&["query", "release/1.2.3"]);
+    assert_success(&queried);
+
+    let removed = fx.lucus(&["remove", "release/1.2.3"]);
+    assert_success(&removed);
+    assert!(!branch_exists(&fx, "release/1.2.3"));
+}
+
+/// Regression: option-like branch names starting with `-` are rejected by
+/// lucus itself (passed via `--` so clap does not intercept them first).
+#[test]
+fn new_rejects_leading_dash_branch_name() {
+    let fx = Fixture::new("new-dash");
+    let output = fx.lucus(&["new", "--", "--force"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    assert!(
+        stderr(&output).contains("could be parsed as a git option"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).trim().is_empty(),
+        "nothing should be created for a rejected branch"
+    );
 }
 
 #[test]

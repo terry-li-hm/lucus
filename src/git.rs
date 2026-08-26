@@ -154,6 +154,7 @@ pub fn worktree_add(repo_root: &Path, branch: &str, path: &Path) -> Result<()> {
         .arg(repo_root)
         .args(["worktree", "add", "-b"])
         .arg(branch)
+        .arg("--")
         .arg(path)
         .output()
         .with_context(|| {
@@ -177,6 +178,7 @@ pub fn worktree_remove(repo_root: &Path, path: &Path, force: bool) -> Result<()>
         .arg(repo_root)
         .args(["worktree", "remove"])
         .args(force.then_some("--force"))
+        .arg("--")
         .arg(path)
         .output()
         .with_context(|| {
@@ -199,7 +201,9 @@ pub fn branch_delete(repo_root: &Path, branch: &str, force: bool) -> Result<()> 
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["branch", flag, branch])
+        .args(["branch", flag])
+        .arg("--")
+        .arg(branch)
         .output()
         .with_context(|| format!("failed to execute git branch {flag} {branch}"))?;
 
@@ -222,15 +226,13 @@ pub fn resolve_worktree_path(template: &str, repo_root: &Path, branch: &str) -> 
             )
         })?;
 
-    let safe_branch = sanitize_branch(branch);
-    ensure!(
-        !safe_branch.is_empty(),
-        "branch name is empty after sanitization"
-    );
+    // Defense in depth: callers validate the branch name, but never render an
+    // unvalidated name into a filesystem path.
+    validate_branch_name(branch)?;
 
     let rendered = template
         .replace("{repo}", repo_name)
-        .replace("{branch}", &safe_branch);
+        .replace("{branch}", branch);
 
     let raw_path = PathBuf::from(rendered);
     let absolute = if raw_path.is_absolute() {
@@ -257,12 +259,59 @@ pub fn resolve_worktree_path(template: &str, repo_root: &Path, branch: &str) -> 
     Ok(normalized)
 }
 
-pub fn sanitize_branch(branch: &str) -> String {
-    branch
+/// Validate a user-supplied branch name without rewriting it.
+///
+/// Valid names are returned unchanged — dots such as `release/1.2.3` are
+/// preserved and distinct names never collapse into each other. Names that
+/// are not clearly safe are rejected with an explicit error rather than
+/// silently reinterpreted: the charset is `[A-Za-z0-9/._-]`, no leading `-`
+/// (option injection into git subprocesses), no leading `.` or `/`, no `..`
+/// (path traversal), no `//`, no component starting with `.`, no trailing
+/// `/`, `.`, or `.lock`, and a 60-character cap.
+pub fn validate_branch_name(branch: &str) -> Result<&str> {
+    ensure!(!branch.is_empty(), "branch name is empty");
+
+    let invalid: String = branch
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '/' || *c == '-' || *c == '_')
-        .take(60)
-        .collect::<String>()
+        .filter(|c| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.')))
+        .collect();
+    ensure!(
+        invalid.is_empty(),
+        "branch name '{branch}' contains characters not allowed in branch names: '{invalid}'"
+    );
+
+    ensure!(
+        !branch.starts_with('-'),
+        "branch name '{branch}' starts with '-' and could be parsed as a git option"
+    );
+    ensure!(
+        !branch.starts_with('.') && !branch.starts_with('/'),
+        "branch name '{branch}' must not start with '.' or '/'"
+    );
+    ensure!(
+        !branch.contains(".."),
+        "branch name '{branch}' must not contain '..'"
+    );
+    ensure!(
+        !branch.contains("//"),
+        "branch name '{branch}' must not contain '//'"
+    );
+    ensure!(
+        !branch
+            .split('/')
+            .any(|component| component.starts_with('.')),
+        "branch name '{branch}' must not contain a component starting with '.'"
+    );
+    ensure!(
+        !branch.ends_with('/') && !branch.ends_with('.') && !branch.ends_with(".lock"),
+        "branch name '{branch}' must not end with '/', '.', or '.lock'"
+    );
+    ensure!(
+        branch.len() <= 60,
+        "branch name '{branch}' is longer than 60 characters"
+    );
+
+    Ok(branch)
 }
 
 /// Resolve `path` to its physical form by canonicalizing the deepest
@@ -441,43 +490,130 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_branch_keeps_safe_characters() {
-        assert_eq!(sanitize_branch("feat/auth"), "feat/auth");
-        assert_eq!(sanitize_branch("feat-auth_1"), "feat-auth_1");
-        assert_eq!(sanitize_branch(""), "");
+    fn validate_branch_name_accepts_safe_names_unchanged() {
+        assert_eq!(
+            validate_branch_name("feat/auth").expect("safe"),
+            "feat/auth"
+        );
+        assert_eq!(
+            validate_branch_name("feat-auth_1").expect("safe"),
+            "feat-auth_1"
+        );
+        assert_eq!(
+            validate_branch_name("a/b-c_d.e").expect("safe"),
+            "a/b-c_d.e"
+        );
     }
 
     #[test]
-    fn sanitize_branch_strips_spaces_and_unicode_and_caps_length() {
-        assert_eq!(sanitize_branch("feat/foo bar"), "feat/foobar");
-        assert_eq!(sanitize_branch("feat/你好"), "feat/");
-        assert_eq!(sanitize_branch("!!!"), "");
-        let long = "a".repeat(80);
-        assert_eq!(sanitize_branch(&long).len(), 60);
+    fn validate_branch_name_rejects_invalid_characters_and_overlength() {
+        let space = validate_branch_name("feat/foo bar").expect_err("space");
+        assert!(
+            space.to_string().contains("characters not allowed"),
+            "unexpected error: {space:#}"
+        );
+        let unicode = validate_branch_name("feat/你好").expect_err("unicode");
+        assert!(
+            unicode.to_string().contains("characters not allowed"),
+            "unexpected error: {unicode:#}"
+        );
+        let empty = validate_branch_name("").expect_err("empty");
+        assert!(
+            empty.to_string().contains("branch name is empty"),
+            "unexpected error: {empty:#}"
+        );
+        let long = validate_branch_name(&"a".repeat(61)).expect_err("too long");
+        assert!(
+            long.to_string().contains("longer than 60"),
+            "unexpected error: {long:#}"
+        );
+        assert_eq!(
+            validate_branch_name(&"a".repeat(60)).expect("exactly 60"),
+            "a".repeat(60)
+        );
+    }
+
+    /// Distinct valid names must not collapse into each other through
+    /// rewriting: validation is identity-preserving.
+    #[test]
+    fn validate_branch_name_never_rewrites_distinct_names() {
+        let left = validate_branch_name("release/1.2.3").expect("dotted");
+        let right = validate_branch_name("release/1.23").expect("dotted");
+        assert_ne!(left, right);
+        assert_eq!(left, "release/1.2.3");
+        assert_eq!(right, "release/1.23");
     }
 
     #[test]
-    fn sanitize_branch_strips_dots_from_path_traversal_attempts() {
-        assert_eq!(sanitize_branch("../../../etc/passwd"), "///etc/passwd");
+    fn validate_branch_name_rejects_traversal_and_component_shapes() {
+        for name in [
+            "../../../etc/passwd",
+            "..",
+            "a..b",
+            "a//b",
+            "/abs",
+            ".hidden",
+            "feat/.env",
+            "feat/",
+            "v1.0.",
+            "feat/branch.lock",
+        ] {
+            assert!(
+                validate_branch_name(name).is_err(),
+                "'{name}' must be rejected"
+            );
+        }
+        // sanity: the surrounding legitimate shapes stay valid
+        validate_branch_name("v1.0.0").expect("plain dotted version is valid");
+        validate_branch_name("release/1.2.3").expect("dotted component is valid");
     }
 
-    /// Expected: a user-supplied branch such as `release/1.2.3` is created
-    /// unchanged; sanitization is only for path substitution / generated names.
-    /// Observed: `.` is stripped, so `release/1.2.3` becomes `release/123`.
+    /// Regression: valid dots in user-supplied names such as `release/1.2.3`
+    /// are preserved; sanitization no longer silently rewrites them to
+    /// `release/123`.
     #[test]
-    fn documents_defect_sanitize_strips_dots_from_user_branch() {
-        assert_eq!(sanitize_branch("release/1.2.3"), "release/123");
-        assert_eq!(sanitize_branch("v1.0.0"), "v100");
+    fn branch_validation_preserves_dots_in_user_branch() {
+        assert_eq!(
+            validate_branch_name("release/1.2.3").expect("dotted name"),
+            "release/1.2.3"
+        );
+        assert_eq!(
+            validate_branch_name("v1.0.0").expect("dotted name"),
+            "v1.0.0"
+        );
     }
 
-    /// Expected: leading dashes are stripped or the git subprocess is given
-    /// `--` so the branch cannot be parsed as a flag.
-    /// Observed: `--force` survives sanitization and would be passed as `-b
-    /// --force`.
+    /// Regression: names beginning with `-` are rejected explicitly instead
+    /// of surviving validation and being passed to git as an option.
     #[test]
-    fn documents_defect_sanitize_keeps_leading_dashes() {
-        assert_eq!(sanitize_branch("--force"), "--force");
-        assert_eq!(sanitize_branch("-n"), "-n");
+    fn branch_validation_rejects_leading_dashes() {
+        let err = validate_branch_name("--force").expect_err("option-like name");
+        assert!(
+            err.to_string().contains("could be parsed as a git option"),
+            "unexpected error: {err:#}"
+        );
+        let single = validate_branch_name("-n").expect_err("single dash");
+        assert!(
+            single
+                .to_string()
+                .contains("could be parsed as a git option"),
+            "unexpected error: {single:#}"
+        );
+    }
+
+    #[test]
+    fn branch_delete_removes_dotted_branch_after_dashdash_separator() {
+        let repo = init_repo("branch-dotted");
+        let wt = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-dotted-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "release/1.2.3", &wt).expect("worktree add dotted");
+        assert!(branch_exists(repo.path(), "release/1.2.3"));
+        worktree_remove(repo.path(), &wt, false).expect("worktree remove dotted");
+        branch_delete(repo.path(), "release/1.2.3", false).expect("branch delete dotted");
+        assert!(!branch_exists(repo.path(), "release/1.2.3"));
     }
 
     #[test]
@@ -497,12 +633,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_worktree_path_rejects_empty_sanitized_branch() {
-        let repo = init_repo("resolve-empty");
+    fn resolve_worktree_path_rejects_invalid_branch_names() {
+        let repo = init_repo("resolve-invalid");
         let err = resolve_worktree_path("../{repo}.{branch}", repo.path(), "!!!")
-            .expect_err("empty sanitized branch should fail");
+            .expect_err("invalid branch should fail");
         assert!(
-            err.to_string().contains("empty after sanitization"),
+            err.to_string().contains("characters not allowed"),
             "unexpected error: {err:#}"
         );
     }
