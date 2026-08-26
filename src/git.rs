@@ -194,17 +194,18 @@ pub fn worktree_remove(repo_root: &Path, path: &Path, force: bool) -> Result<()>
     Ok(())
 }
 
-pub fn branch_delete(repo_root: &Path, branch: &str) -> Result<()> {
+pub fn branch_delete(repo_root: &Path, branch: &str, force: bool) -> Result<()> {
+    let flag = if force { "-D" } else { "-d" };
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["branch", "-D", branch])
+        .args(["branch", flag, branch])
         .output()
-        .with_context(|| format!("failed to execute git branch -D {branch}"))?;
+        .with_context(|| format!("failed to execute git branch {flag} {branch}"))?;
 
     ensure!(
         output.status.success(),
-        "git branch -D failed for {branch}: {}",
+        "git branch {flag} failed for {branch}: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
@@ -539,7 +540,7 @@ mod tests {
         assert_eq!(dirty.uncommitted, 1);
 
         worktree_remove(repo.path(), &wt, true).expect("force remove dirty worktree");
-        branch_delete(repo.path(), "feat-auth").expect("delete branch");
+        branch_delete(repo.path(), "feat-auth", false).expect("delete branch");
         assert!(!wt.exists());
         assert!(!branch_exists(repo.path(), "feat-auth"));
     }
@@ -561,7 +562,7 @@ mod tests {
         );
         assert!(wt.exists());
         worktree_remove(repo.path(), &wt, true).expect("cleanup");
-        branch_delete(repo.path(), "feat-dirty").expect("cleanup branch");
+        branch_delete(repo.path(), "feat-dirty", false).expect("cleanup branch");
     }
 
     #[test]
@@ -595,15 +596,13 @@ mod tests {
             "unexpected error: {err:#}"
         );
         worktree_remove(repo.path(), &wt, false).expect("cleanup");
-        branch_delete(repo.path(), "feat-dup").expect("cleanup branch");
+        branch_delete(repo.path(), "feat-dup", false).expect("cleanup branch");
     }
 
-    /// Expected: ordinary branch deletion uses `git branch -d` and refuses
-    /// unique commits that are not merged.
-    /// Observed: `branch_delete` always runs `git branch -D`, so an unmerged
-    /// branch is removed and its unique commits become unreachable.
+    /// Ordinary branch deletion uses `git branch -d` and refuses unique
+    /// commits that are not merged; only `--force` uses `git branch -D`.
     #[test]
-    fn documents_defect_branch_delete_force_drops_unmerged_commits() {
+    fn branch_delete_without_force_refuses_unmerged_branch() {
         let repo = init_repo("force-delete");
         git(repo.path(), &["checkout", "-b", "unique"]);
         fs::write(repo.path().join("unique.txt"), "only-on-unique").expect("write unique");
@@ -614,8 +613,13 @@ mod tests {
             .to_owned();
         git(repo.path(), &["checkout", "main"]);
 
-        branch_delete(repo.path(), "unique").expect("force delete currently succeeds");
-        assert!(!branch_exists(repo.path(), "unique"));
+        let err = branch_delete(repo.path(), "unique", false)
+            .expect_err("unmerged branch delete should fail");
+        assert!(
+            err.to_string().contains("git branch -d failed"),
+            "unexpected error: {err:#}"
+        );
+        assert!(branch_exists(repo.path(), "unique"));
 
         let mut cat_cmd = Command::new("git");
         cat_cmd
@@ -628,5 +632,8 @@ mod tests {
             cat.status.success(),
             "unique commit object should still exist until gc"
         );
+
+        branch_delete(repo.path(), "unique", true).expect("force delete unmerged branch");
+        assert!(!branch_exists(repo.path(), "unique"));
     }
 }

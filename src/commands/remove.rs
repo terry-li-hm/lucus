@@ -19,7 +19,7 @@ pub fn run(config: &Config, branch: &str, force: bool) -> Result<()> {
 
     hooks::run_blocking(&config.hooks.pre_remove, &hook_context)?;
     git::worktree_remove(&repo_root, &path, force)?;
-    git::branch_delete(&repo_root, branch)?;
+    git::branch_delete(&repo_root, branch, force)?;
     hooks::run_blocking(&config.hooks.post_remove, &hook_context)?;
 
     eprintln!(

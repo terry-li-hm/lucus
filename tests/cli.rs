@@ -366,12 +366,10 @@ fn remove_dirty_with_force_succeeds() {
     assert!(!branch_exists(&fx, "feat-force"));
 }
 
-/// Expected: `lucus remove` without `--force` uses `git branch -d` and
-/// refuses to delete a branch that still has unique commits.
-/// Observed: the worktree is removed and `git branch -D` deletes the branch
-/// even though those commits are not reachable from main.
+/// `lucus remove` without `--force` uses `git branch -d` and refuses to
+/// delete a branch that still has unique commits.
 #[test]
-fn documents_defect_remove_force_deletes_unmerged_branch() {
+fn remove_without_force_refuses_unmerged_branch() {
     let fx = Fixture::new("remove-unmerged");
     let created = fx.lucus(&["new", "feat-unique"]);
     assert_success(&created);
@@ -379,26 +377,45 @@ fn documents_defect_remove_force_deletes_unmerged_branch() {
     fs::write(Path::new(&path).join("unique.txt"), "only-here").expect("unique file");
     git(Path::new(&path), &fx.root, &["add", "unique.txt"]);
     git(Path::new(&path), &fx.root, &["commit", "-m", "unique"]);
-    let sha =
-        String::from_utf8_lossy(&git(Path::new(&path), &fx.root, &["rev-parse", "HEAD"]).stdout)
-            .trim()
-            .to_owned();
+    let head = git(Path::new(&path), &fx.root, &["rev-parse", "HEAD"]);
+    let sha = String::from_utf8_lossy(&head.stdout).trim().to_owned();
 
-    let removed = fx.lucus(&["remove", "feat-unique"]);
-    assert_success(&removed);
-    assert!(!branch_exists(&fx, "feat-unique"));
-    assert!(!Path::new(&path).exists());
+    let output = fx.lucus(&["remove", "feat-unique"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    assert!(
+        stderr(&output).contains("git branch -d failed"),
+        "unexpected stderr:\n{}",
+        stderr(&output)
+    );
+    assert!(branch_exists(&fx, "feat-unique"));
 
-    let cat = Command::new("git")
+    let mut cat_cmd = Command::new("git");
+    cat_cmd
         .args(["-C"])
         .arg(&fx.repo)
-        .args(["cat-file", "-t", &sha])
-        .output()
-        .expect("cat-file");
+        .args(["cat-file", "-t", &sha]);
+    let cat = cat_cmd.output().expect("cat-file");
     assert!(
         cat.status.success(),
         "unique commit object should still exist until gc"
     );
+}
+
+#[test]
+fn remove_with_force_deletes_unmerged_branch() {
+    let fx = Fixture::new("remove-unmerged-force");
+    let created = fx.lucus(&["new", "feat-unique-force"]);
+    assert_success(&created);
+    let path = stdout(&created).trim().to_owned();
+    fs::write(Path::new(&path).join("unique.txt"), "only-here").expect("unique file");
+    git(Path::new(&path), &fx.root, &["add", "unique.txt"]);
+    git(Path::new(&path), &fx.root, &["commit", "-m", "unique"]);
+
+    let removed = fx.lucus(&["remove", "--force", "feat-unique-force"]);
+    assert_success(&removed);
+    assert!(!Path::new(&path).exists());
+    assert!(!branch_exists(&fx, "feat-unique-force"));
 }
 
 #[test]
