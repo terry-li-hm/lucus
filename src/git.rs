@@ -100,6 +100,41 @@ pub fn find_worktree_by_branch(repo_root: &Path, branch: &str) -> Result<Option<
         .map(|entry| entry.path))
 }
 
+/// Revalidate, immediately before removal, that the worktree at `path` is
+/// still registered for `branch` and that its HEAD still points at `branch`.
+///
+/// `pre_remove` hooks and concurrent processes can switch the worktree to a
+/// different branch, detach its HEAD, or remove it between resolution and
+/// destruction. Every such change must abort the removal before any
+/// destructive step so unique state is preserved.
+pub fn ensure_worktree_attached_to_branch(
+    repo_root: &Path,
+    path: &Path,
+    branch: &str,
+) -> Result<()> {
+    let current = find_worktree_by_branch(repo_root, branch)?;
+    ensure!(
+        current.as_deref() == Some(path),
+        "worktree {} is no longer attached to branch {branch} (found {current:?}); \
+         refusing to remove because a hook or concurrent action changed it",
+        path.display()
+    );
+
+    let repo = Repository::open(path)
+        .with_context(|| format!("failed to open worktree repository at {}", path.display()))?;
+    let head = repo
+        .head()
+        .with_context(|| format!("failed to read HEAD of worktree at {}", path.display()))?;
+    ensure!(
+        head.is_branch() && head.shorthand() == Some(branch),
+        "worktree {} HEAD no longer points at branch {branch}; \
+         refusing to remove because a hook or concurrent action changed it",
+        path.display()
+    );
+
+    Ok(())
+}
+
 pub fn worktree_stats(worktree_path: &Path) -> Result<WorktreeStats> {
     let output = Command::new("git")
         .arg("-C")
@@ -614,6 +649,78 @@ mod tests {
         worktree_remove(repo.path(), &wt, false).expect("worktree remove dotted");
         branch_delete(repo.path(), "release/1.2.3", false).expect("branch delete dotted");
         assert!(!branch_exists(repo.path(), "release/1.2.3"));
+    }
+
+    #[test]
+    fn ensure_worktree_attached_accepts_matching_worktree() {
+        let repo = init_repo("ensure-ok");
+        let wt = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-ensure-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-auth", &wt).expect("worktree add");
+        let path = find_worktree_by_branch(repo.path(), "feat-auth")
+            .expect("find")
+            .expect("path");
+        ensure_worktree_attached_to_branch(repo.path(), &path, "feat-auth")
+            .expect("attached worktree should pass revalidation");
+        worktree_remove(repo.path(), &wt, false).expect("cleanup");
+        branch_delete(repo.path(), "feat-auth", false).expect("cleanup branch");
+    }
+
+    #[test]
+    fn ensure_worktree_attached_rejects_detached_head() {
+        let repo = init_repo("ensure-detached");
+        let wt = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-detached-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-detached", &wt).expect("worktree add");
+        let path = find_worktree_by_branch(repo.path(), "feat-detached")
+            .expect("find")
+            .expect("path");
+        git(&wt, &["checkout", "--detach"]);
+
+        let err = ensure_worktree_attached_to_branch(repo.path(), &path, "feat-detached")
+            .expect_err("detached worktree must be refused");
+        assert!(
+            err.to_string().contains("no longer attached"),
+            "unexpected error: {err:#}"
+        );
+        // Nothing is destroyed on refusal.
+        assert!(wt.exists());
+        assert!(branch_exists(repo.path(), "feat-detached"));
+        worktree_remove(repo.path(), &wt, true).expect("cleanup");
+        branch_delete(repo.path(), "feat-detached", true).expect("cleanup branch");
+    }
+
+    #[test]
+    fn ensure_worktree_attached_rejects_switched_branch() {
+        let repo = init_repo("ensure-switched");
+        git(repo.path(), &["branch", "other"]);
+        let wt = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-switched-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-switch", &wt).expect("worktree add");
+        let path = find_worktree_by_branch(repo.path(), "feat-switch")
+            .expect("find")
+            .expect("path");
+        git(&wt, &["checkout", "other"]);
+
+        let err = ensure_worktree_attached_to_branch(repo.path(), &path, "feat-switch")
+            .expect_err("switched worktree must be refused");
+        assert!(
+            err.to_string().contains("no longer attached"),
+            "unexpected error: {err:#}"
+        );
+        assert!(wt.exists());
+        assert!(branch_exists(repo.path(), "feat-switch"));
+        worktree_remove(repo.path(), &wt, true).expect("cleanup");
+        branch_delete(repo.path(), "feat-switch", true).expect("cleanup branch");
     }
 
     #[test]

@@ -517,6 +517,105 @@ fn remove_with_force_deletes_unmerged_branch() {
     assert!(!branch_exists(&fx, "feat-unique-force"));
 }
 
+/// Regression: a `pre_remove` hook that switches the worktree to another
+/// branch must abort the removal; the worktree, branch, and unique commits
+/// are preserved untouched.
+#[test]
+fn remove_refuses_when_pre_remove_hook_switches_branch() {
+    let fx = Fixture::new("remove-hook-race");
+    let created = fx.lucus(&["new", "feat-race"]);
+    assert_success(&created);
+    let path = stdout(&created).trim().to_owned();
+    fs::write(Path::new(&path).join("race.txt"), "unique").expect("unique file");
+    git(Path::new(&path), &fx.root, &["add", "race.txt"]);
+    git(Path::new(&path), &fx.root, &["commit", "-m", "race"]);
+    let head = git(Path::new(&path), &fx.root, &["rev-parse", "HEAD"]);
+    let sha = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+
+    git(&fx.repo, &fx.root, &["branch", "hook-target"]);
+    let quote = char::from_u32(0x22).expect("quote");
+    let backslash = char::from_u32(0x5c).expect("backslash");
+    let hook = format!(
+        "git -C {backslash}{quote}$LUCUS_WORKTREE_PATH{backslash}{quote} checkout hook-target"
+    );
+    fx.write_config(&format!("[hooks]\npre_remove = [\"{hook}\"]\n"));
+
+    let output = fx.lucus(&["remove", "feat-race"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    assert!(
+        stderr(&output).contains("no longer attached"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    assert!(Path::new(&path).is_dir(), "worktree must be preserved");
+    assert!(branch_exists(&fx, "feat-race"), "branch must be preserved");
+
+    let mut cat_cmd = Command::new("git");
+    cat_cmd
+        .args(["-C"])
+        .arg(&fx.repo)
+        .args(["cat-file", "-t", &sha]);
+    let cat = cat_cmd.output().expect("cat-file");
+    assert!(
+        cat.status.success(),
+        "unique commit object must survive the refused removal"
+    );
+}
+
+/// Regression: a `pre_remove` hook that detaches the worktree HEAD must
+/// abort the removal with all state preserved.
+#[test]
+fn remove_refuses_when_pre_remove_hook_detaches_head() {
+    let fx = Fixture::new("remove-hook-detach");
+    let created = fx.lucus(&["new", "feat-detach"]);
+    assert_success(&created);
+    let path = stdout(&created).trim().to_owned();
+    let quote = char::from_u32(0x22).expect("quote");
+    let backslash = char::from_u32(0x5c).expect("backslash");
+    let hook = format!(
+        "git -C {backslash}{quote}$LUCUS_WORKTREE_PATH{backslash}{quote} checkout --detach"
+    );
+    fx.write_config(&format!("[hooks]\npre_remove = [\"{hook}\"]\n"));
+
+    let output = fx.lucus(&["remove", "feat-detach"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    assert!(
+        stderr(&output).contains("no longer attached"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    assert!(Path::new(&path).is_dir(), "worktree must be preserved");
+    assert!(
+        branch_exists(&fx, "feat-detach"),
+        "branch must be preserved"
+    );
+}
+
+/// Regression: a worktree detached out of band (no hook) is refused too.
+#[test]
+fn remove_refuses_when_worktree_detached_out_of_band() {
+    let fx = Fixture::new("remove-oob-detach");
+    let created = fx.lucus(&["new", "feat-oob"]);
+    assert_success(&created);
+    let path = stdout(&created).trim().to_owned();
+    git(Path::new(&path), &fx.root, &["checkout", "--detach"]);
+
+    let output = fx.lucus(&["remove", "feat-oob"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    // Detached before lucus even resolves: the initial lookup already
+    // refuses because the branch is no longer checked out anywhere.
+    assert!(
+        stderr(&output).contains("no worktree found for branch feat-oob"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    assert!(Path::new(&path).is_dir(), "worktree must be preserved");
+    assert!(branch_exists(&fx, "feat-oob"), "branch must be preserved");
+}
+
 #[test]
 fn init_zsh_writes_wrapper_under_isolated_home() {
     let fx = Fixture::new("init");

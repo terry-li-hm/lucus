@@ -12,12 +12,26 @@
 - [x] 2. Canonical in-repo worktree guard
 - [x] 3. Branch names and Git option safety
 - [x] 4. Valid NDJSON for every control character
-- [ ] 5. Branch/worktree ownership revalidation before removal
+- [x] 5. Branch/worktree ownership revalidation before removal
 - [ ] 6. Stale worktree metadata recovery
 - [ ] 7. Failed creation rollback
 - [ ] 8. Final adversarial audit + RESULT.md
 
-**Current milestone:** 5
+**Current milestone:** 6
+
+## Milestone 5 — complete (23:24 HKT)
+
+- Added `git::ensure_worktree_attached_to_branch`: after `pre_remove` (and before any destructive
+  step) `remove` re-resolves branch→worktree and requires the same canonical path, then re-opens the
+  worktree repo and requires HEAD to still be that branch. Hook/concurrent switch, detach, or
+  unregistration → explicit refusal with all state preserved. Detached-before-invocation is caught
+  at initial resolution ("no worktree found") — also a safe refusal.
+- Unit regressions in `git.rs`: accept-matching, reject-detached, reject-switched (each asserts
+  worktree+branch preserved on refusal).
+- e2e regressions: `remove_refuses_when_pre_remove_hook_switches_branch` (deterministic hook race;
+  also proves the unique commit object survives), `remove_refuses_when_pre_remove_hook_detaches_head`,
+  `remove_refuses_when_worktree_detached_out_of_band`.
+- Gate: fmt PASS · bin 78/78 · cli 32/32 · clippy PASS.
 
 ## Milestone 4 — complete (23:15 HKT)
 

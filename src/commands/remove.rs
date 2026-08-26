@@ -18,6 +18,11 @@ pub fn run(config: &Config, branch: &str, force: bool) -> Result<()> {
     };
 
     hooks::run_blocking(&config.hooks.pre_remove, &hook_context)?;
+
+    // `pre_remove` hooks and concurrent processes can change the worktree;
+    // revalidate ownership before any destructive step.
+    git::ensure_worktree_attached_to_branch(&repo_root, &path, branch)?;
+
     git::worktree_remove(&repo_root, &path, force)?;
     git::branch_delete(&repo_root, branch, force)?;
     hooks::run_blocking(&config.hooks.post_remove, &hook_context)?;
