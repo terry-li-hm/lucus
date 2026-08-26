@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow, ensure};
 use git2::Repository;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -76,11 +77,14 @@ pub fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>> {
         let wt = repo
             .find_worktree(name)
             .with_context(|| format!("failed to read worktree metadata for {name}"))?;
-        let path = wt
-            .path()
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize worktree path for {name}"))?;
-        let wt_repo = Repository::open(wt.path())
+        let path = match wt.path().canonicalize() {
+            Ok(path) => path,
+            // The registered directory is gone (out-of-band loss). Skip the
+            // stale registration so listings keep working; removal recovers
+            // via `git worktree prune`.
+            Err(_) => continue,
+        };
+        let wt_repo = Repository::open(&path)
             .with_context(|| format!("failed to open worktree repository for {name}"))?;
         let branch = branch_for_repo(&wt_repo)?;
         entries.push(WorktreeEntry { branch, path });
@@ -98,6 +102,77 @@ pub fn find_worktree_by_branch(repo_root: &Path, branch: &str) -> Result<Option<
         .into_iter()
         .find(|entry| entry.branch == branch)
         .map(|entry| entry.path))
+}
+
+/// A registered worktree whose working directory no longer exists.
+#[derive(Clone, Debug)]
+pub struct StaleWorktree {
+    pub name: String,
+    pub branch: Option<String>,
+}
+
+/// List registered worktrees whose directories are missing.
+///
+/// The branch is read from the worktree's administrative `HEAD` file, which
+/// survives the loss of the working directory; `None` means the stale
+/// registration is detached or unreadable.
+pub fn stale_worktrees(repo_root: &Path) -> Result<Vec<StaleWorktree>> {
+    let repo = Repository::open(repo_root)
+        .with_context(|| format!("failed to open repository at {}", repo_root.display()))?;
+
+    let mut stale = Vec::new();
+    for name in repo
+        .worktrees()
+        .context("failed to list worktrees")?
+        .iter()
+        .flatten()
+    {
+        let Ok(wt) = repo.find_worktree(name) else {
+            continue;
+        };
+        if wt.path().canonicalize().is_ok() {
+            continue; // live worktree
+        }
+        let branch = read_worktree_admin_head_branch(&repo, name);
+        stale.push(StaleWorktree {
+            name: name.to_owned(),
+            branch,
+        });
+    }
+    Ok(stale)
+}
+
+fn read_worktree_admin_head_branch(repo: &Repository, name: &str) -> Option<String> {
+    let head_path = repo.path().join("worktrees").join(name).join("HEAD");
+    let head = fs::read_to_string(head_path).ok()?;
+    let branch = head.trim().strip_prefix("ref: refs/heads/")?;
+    Some(branch.to_owned())
+}
+
+/// Prune registrations whose working directories are missing.
+///
+/// Bounded recovery: plain `git worktree prune` only removes administrative
+/// metadata for directories that no longer exist — it never deletes a live
+/// directory or a branch.
+pub fn prune_stale_worktrees(repo_root: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "prune"])
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to execute git worktree prune in {}",
+                repo_root.display()
+            )
+        })?;
+
+    ensure!(
+        output.status.success(),
+        "git worktree prune failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
 
 /// Revalidate, immediately before removal, that the worktree at `path` is
@@ -229,6 +304,23 @@ pub fn worktree_remove(repo_root: &Path, path: &Path, force: bool) -> Result<()>
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())
+}
+
+pub fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["show-ref", "--verify", "--quiet"])
+        .arg("--")
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to verify branch {branch} in {}",
+                repo_root.display()
+            )
+        })?;
+    Ok(output.status.success())
 }
 
 pub fn branch_delete(repo_root: &Path, branch: &str, force: bool) -> Result<()> {
@@ -721,6 +813,94 @@ mod tests {
         assert!(branch_exists(repo.path(), "feat-switch"));
         worktree_remove(repo.path(), &wt, true).expect("cleanup");
         branch_delete(repo.path(), "feat-switch", true).expect("cleanup branch");
+    }
+
+    #[test]
+    fn list_and_find_survive_missing_worktree_directory() {
+        let repo = init_repo("stale-list");
+        let wt = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-stale-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-gone", &wt).expect("worktree add");
+        fs::remove_dir_all(&wt).expect("out-of-band directory loss");
+
+        let entries = list_worktrees(repo.path()).expect("list must not brick");
+        assert_eq!(entries.len(), 1, "only the live main worktree remains");
+        assert_eq!(entries[0].branch, "main");
+        assert_eq!(
+            find_worktree_by_branch(repo.path(), "feat-gone").expect("find"),
+            None,
+            "stale registration must not resolve"
+        );
+
+        prune_stale_worktrees(repo.path()).expect("prune");
+        assert!(
+            !repo.path().join("worktrees").join("feat-gone").exists(),
+            "stale administrative metadata must be pruned"
+        );
+        branch_delete(repo.path(), "feat-gone", false).expect("cleanup branch");
+    }
+
+    #[test]
+    fn stale_worktrees_reports_missing_directory_and_branch() {
+        let repo = init_repo("stale-report");
+        let wt = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-report-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-report", &wt).expect("worktree add");
+        assert!(stale_worktrees(repo.path()).expect("stale").is_empty());
+        fs::remove_dir_all(&wt).expect("out-of-band directory loss");
+
+        let stale = stale_worktrees(repo.path()).expect("stale");
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].branch.as_deref(), Some("feat-report"));
+
+        prune_stale_worktrees(repo.path()).expect("prune");
+        assert!(stale_worktrees(repo.path()).expect("stale").is_empty());
+        branch_delete(repo.path(), "feat-report", false).expect("cleanup branch");
+    }
+
+    #[test]
+    fn prune_never_removes_live_worktree_or_branch() {
+        let repo = init_repo("stale-live");
+        let live = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-live-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let dead = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-dead-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-live", &live).expect("worktree add live");
+        worktree_add(repo.path(), "feat-dead", &dead).expect("worktree add dead");
+        fs::remove_dir_all(&dead).expect("out-of-band directory loss");
+
+        prune_stale_worktrees(repo.path()).expect("prune");
+
+        assert!(
+            live.exists(),
+            "live worktree directory must survive pruning"
+        );
+        assert!(
+            branch_exists(repo.path(), "feat-live"),
+            "live branch must survive"
+        );
+        assert!(!dead.exists());
+        // feat-live is still registered and resolvable.
+        assert!(
+            find_worktree_by_branch(repo.path(), "feat-live")
+                .expect("find")
+                .is_some()
+        );
+        worktree_remove(repo.path(), &live, false).expect("cleanup");
+        branch_delete(repo.path(), "feat-live", false).expect("cleanup branch");
+        branch_delete(repo.path(), "feat-dead", false).expect("cleanup dead branch");
     }
 
     #[test]

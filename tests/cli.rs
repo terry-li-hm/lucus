@@ -616,6 +616,99 @@ fn remove_refuses_when_worktree_detached_out_of_band() {
     assert!(branch_exists(&fx, "feat-oob"), "branch must be preserved");
 }
 
+/// Regression: out-of-band loss of a registered worktree directory must not
+/// brick `list` or `query`, and `remove` recovers by pruning the stale
+/// registration and deleting the branch with ordinary merged-state
+/// protection.
+#[test]
+fn list_query_and_remove_survive_out_of_band_directory_loss() {
+    let fx = Fixture::new("stale-recovery");
+    let created = fx.lucus(&["new", "feat-stale"]);
+    assert_success(&created);
+    let path = stdout(&created).trim().to_owned();
+    fs::remove_dir_all(&path).expect("out-of-band directory loss");
+
+    let listed = fx.lucus(&["list"]);
+    assert_success(&listed);
+    assert!(
+        stdout(&listed).contains("\"branch\":\"main\""),
+        "live entries must still be listed: {}",
+        stdout(&listed)
+    );
+    assert!(
+        !stdout(&listed).contains("feat-stale"),
+        "stale registration must not be listed"
+    );
+
+    let queried = fx.lucus(&["query", "feat-stale"]);
+    let code = assert_failure(&queried);
+    assert_eq!(code, 1);
+    assert!(stderr(&queried).contains("no worktree found"));
+
+    let removed = fx.lucus(&["remove", "feat-stale"]);
+    assert_success(&removed);
+    assert!(
+        stderr(&removed).contains("pruned stale worktree registration"),
+        "unexpected stderr: {}",
+        stderr(&removed)
+    );
+    assert!(!branch_exists(&fx, "feat-stale"));
+
+    // The repo is fully usable afterwards.
+    let again = fx.lucus(&["new", "feat-stale"]);
+    assert_success(&again);
+}
+
+/// Regression: recovery of a stale worktree for a branch with unique commits
+/// still refuses to discard them without `--force`.
+#[test]
+fn stale_worktree_recovery_refuses_to_delete_unmerged_branch() {
+    let fx = Fixture::new("stale-unmerged");
+    let created = fx.lucus(&["new", "feat-stale-unique"]);
+    assert_success(&created);
+    let path = stdout(&created).trim().to_owned();
+    fs::write(Path::new(&path).join("unique.txt"), "only-here").expect("unique file");
+    git(Path::new(&path), &fx.root, &["add", "unique.txt"]);
+    git(Path::new(&path), &fx.root, &["commit", "-m", "unique"]);
+    let head = git(Path::new(&path), &fx.root, &["rev-parse", "HEAD"]);
+    let sha = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+    fs::remove_dir_all(&path).expect("out-of-band directory loss");
+
+    let output = fx.lucus(&["remove", "feat-stale-unique"]);
+    let code = assert_failure(&output);
+    assert_eq!(code, 1);
+    assert!(
+        stderr(&output).contains("pruned stale worktree registration"),
+        "unexpected stderr: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("git branch -d failed"),
+        "merged-state protection must apply in recovery: {}",
+        stderr(&output)
+    );
+    assert!(
+        branch_exists(&fx, "feat-stale-unique"),
+        "branch must be preserved"
+    );
+
+    let mut cat_cmd = Command::new("git");
+    cat_cmd
+        .args(["-C"])
+        .arg(&fx.repo)
+        .args(["cat-file", "-t", &sha]);
+    let cat = cat_cmd.output().expect("cat-file");
+    assert!(
+        cat.status.success(),
+        "unique commit object must survive the refused recovery"
+    );
+
+    // Explicit force completes the removal, as in the normal path.
+    let forced = fx.lucus(&["remove", "--force", "feat-stale-unique"]);
+    assert_success(&forced);
+    assert!(!branch_exists(&fx, "feat-stale-unique"));
+}
+
 #[test]
 fn init_zsh_writes_wrapper_under_isolated_home() {
     let fx = Fixture::new("init");

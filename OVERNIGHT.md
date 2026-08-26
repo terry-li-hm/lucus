@@ -13,11 +13,32 @@
 - [x] 3. Branch names and Git option safety
 - [x] 4. Valid NDJSON for every control character
 - [x] 5. Branch/worktree ownership revalidation before removal
-- [ ] 6. Stale worktree metadata recovery
+- [x] 6. Stale worktree metadata recovery
 - [ ] 7. Failed creation rollback
 - [ ] 8. Final adversarial audit + RESULT.md
 
-**Current milestone:** 6
+**Current milestone:** 7
+
+## Milestone 6 — complete (23:34 HKT)
+
+- `list_worktrees` now skips registrations whose directory is missing (previously one lost directory
+  bricked `list`, `query`, `remove`, and `new` through the shared listing error).
+- New `git::stale_worktrees` (detects missing-dir registrations; reads branch from admin `HEAD`
+  file) and bounded `git::prune_stale_worktrees` (plain `git worktree prune` — metadata only, never
+  a live directory or branch).
+- `remove` recovery: stale registration for the named branch → prune then delete branch with the
+  ordinary `-d`/`-D` semantics; branch-only completion only under explicit `--force` (covers the
+  refused-recovery retry). All no-force refusals (detached/moved worktrees) unchanged. New
+  `git::branch_exists` helper (with `--` separator).
+- Ordering lesson (recorded): git refuses `branch -d` while a registered worktree still uses the
+  branch, so recovery must prune first; the failed `-d` then leaves the branch — retryable only
+  via the force-gated branch-only path.
+- Unit regressions: `list_and_find_survive_missing_worktree_directory`,
+  `stale_worktrees_reports_missing_directory_and_branch`, `prune_never_removes_live_worktree_or_branch`.
+- e2e regressions: `list_query_and_remove_survive_out_of_band_directory_loss` (repo reusable
+  afterwards — `new` again), `stale_worktree_recovery_refuses_to_delete_unmerged_branch` (unique
+  commit survives; `--force` retry completes).
+- Gate: fmt PASS · bin 81/81 · cli 34/34 · clippy PASS.
 
 ## Milestone 5 — complete (23:24 HKT)
 
