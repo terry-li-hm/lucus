@@ -245,11 +245,12 @@ pub fn resolve_worktree_path(template: &str, repo_root: &Path, branch: &str) -> 
             repo_root.display()
         )
     })?;
+    let physical = canonicalize_deepest_existing(&normalized)?;
 
     ensure!(
-        !normalized.starts_with(&repo_canonical),
+        !physical.starts_with(&repo_canonical),
         "resolved worktree path {} is inside source repository {}",
-        normalized.display(),
+        physical.display(),
         repo_canonical.display()
     );
 
@@ -262,6 +263,44 @@ pub fn sanitize_branch(branch: &str) -> String {
         .filter(|c| c.is_ascii_alphanumeric() || *c == '/' || *c == '-' || *c == '_')
         .take(60)
         .collect::<String>()
+}
+
+/// Resolve `path` to its physical form by canonicalizing the deepest
+/// existing ancestor and re-appending the not-yet-existing tail.
+///
+/// Worktree target directories do not exist yet when the path is checked,
+/// so a plain `canonicalize` fails; a purely lexical normalization misses
+/// symlinked ancestors (for example `/var` -> `/private/var` on macOS or a
+/// symlinked checkout). Comparing this physically resolved form against the
+/// canonical repository root keeps the in-repo guard consistent across
+/// platforms and symlink layouts.
+fn canonicalize_deepest_existing(path: &Path) -> Result<PathBuf> {
+    let mut pending: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = path.to_path_buf();
+
+    loop {
+        match current.canonicalize() {
+            Ok(resolved) => {
+                let mut physical = resolved;
+                for component in pending.iter().rev() {
+                    physical.push(component);
+                }
+                return Ok(physical);
+            }
+            Err(_) => match (current.parent(), current.file_name()) {
+                (Some(parent), Some(name)) => {
+                    pending.push(name.to_os_string());
+                    current = parent.to_path_buf();
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "failed to resolve physical path for {}",
+                        path.display()
+                    ));
+                }
+            },
+        }
+    }
 }
 
 fn branch_for_repo(repo: &Repository) -> Result<String> {
@@ -369,8 +408,13 @@ mod tests {
 
     fn init_repo(label: &str) -> TestDir {
         let dir = TestDir::new(label);
+        init_repo_at(dir.path());
+        dir
+    }
+
+    fn init_repo_at(dir: &Path) {
         let mut cmd = Command::new("git");
-        cmd.args(["init", "-b", "main"]).arg(dir.path());
+        cmd.args(["init", "-b", "main"]).arg(dir);
         isolate_git(&mut cmd);
         let output = cmd.output().expect("git init should run");
         assert!(
@@ -378,16 +422,12 @@ mod tests {
             "git init failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        git(dir.path(), &["config", "user.name", "Lucus Test"]);
-        git(
-            dir.path(),
-            &["config", "user.email", "lucus-test@example.com"],
-        );
-        git(dir.path(), &["config", "commit.gpgsign", "false"]);
-        fs::write(dir.path().join("README.md"), "hello").expect("write readme");
-        git(dir.path(), &["add", "README.md"]);
-        git(dir.path(), &["commit", "-m", "init"]);
-        dir
+        git(dir, &["config", "user.name", "Lucus Test"]);
+        git(dir, &["config", "user.email", "lucus-test@example.com"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        fs::write(dir.join("README.md"), "hello").expect("write readme");
+        git(dir, &["add", "README.md"]);
+        git(dir, &["commit", "-m", "init"]);
     }
 
     fn branch_exists(repo: &Path, branch: &str) -> bool {
@@ -477,18 +517,61 @@ mod tests {
         assert_eq!(path, outside.path().join("feat-auth"));
     }
 
-    /// Expected: in-repo templates such as `.worktrees/{branch}` are allowed
-    /// so `ensure_gitignore` can ignore the parent directory.
-    /// Observed: any resolved path inside the source repository is rejected.
+    /// Regression: a resolved path that is physically inside the source
+    /// repository is rejected, including when the compared forms differ only
+    /// through symlinked prefixes (macOS `/var` -> `/private/var`) because
+    /// fixtures and checkouts live under symlinked temporary directories.
     #[test]
-    fn documents_defect_in_repo_worktree_path_rejected() {
+    fn in_repo_worktree_path_is_rejected_through_symlinked_temp_prefix() {
         let repo = init_repo("resolve-inside");
         let err = resolve_worktree_path(".worktrees/{branch}", repo.path(), "feat-auth")
-            .expect_err("in-repo template currently fails");
+            .expect_err("in-repo template must be rejected");
         assert!(
             err.to_string().contains("inside source repository"),
             "unexpected error: {err:#}"
         );
+    }
+
+    /// Regression: the guard compares physically resolved paths, so an
+    /// in-repo template is rejected even when the repository is reached
+    /// through a symlinked directory. Synthetic symlink — runs on Linux.
+    #[test]
+    fn in_repo_worktree_path_through_symlinked_repo_dir_is_rejected() {
+        let workspace = TestDir::new("resolve-symlink-repo");
+        let real_repo = workspace.path().join("repo-real");
+        fs::create_dir_all(&real_repo).expect("real repo dir");
+        init_repo_at(&real_repo);
+        let alias = workspace.path().join("alias");
+        std::os::unix::fs::symlink(&real_repo, &alias).expect("alias symlink");
+
+        let err = resolve_worktree_path(".worktrees/{branch}", &alias, "feat-auth")
+            .expect_err("in-repo template through symlink must be rejected");
+        assert!(
+            err.to_string().contains("inside source repository"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// The outside-repository default is unchanged: resolving through a
+    /// symlinked repo directory with the default sibling template still
+    /// yields an outside path.
+    #[test]
+    fn symlinked_repo_dir_default_template_still_resolves_outside() {
+        let workspace = TestDir::new("resolve-symlink-outside");
+        let real_repo = workspace.path().join("repo-real");
+        fs::create_dir_all(&real_repo).expect("real repo dir");
+        init_repo_at(&real_repo);
+        let alias = workspace.path().join("alias");
+        std::os::unix::fs::symlink(&real_repo, &alias).expect("alias symlink");
+
+        let path = resolve_worktree_path("../{repo}.{branch}", &alias, "feat-auth")
+            .expect("default template through symlink should resolve outside");
+        assert!(
+            path.starts_with(workspace.path()),
+            "expected sibling of the real repo, got {}",
+            path.display()
+        );
+        assert!(!path.starts_with(&real_repo));
     }
 
     #[test]

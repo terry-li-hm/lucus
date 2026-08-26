@@ -9,7 +9,7 @@
 
 - [x] 0. Linux offline verification path (disable unused git2 network features; prove offline suite)
 - [x] 1. No implicit or escaping environment-file copies
-- [ ] 2. Canonical in-repo worktree guard
+- [x] 2. Canonical in-repo worktree guard
 - [ ] 3. Branch names and Git option safety
 - [ ] 4. Valid NDJSON for every control character
 - [ ] 5. Branch/worktree ownership revalidation before removal
@@ -17,7 +17,20 @@
 - [ ] 7. Failed creation rollback
 - [ ] 8. Final adversarial audit + RESULT.md
 
-**Current milestone:** 2
+**Current milestone:** 3
+
+## Milestone 2 — complete (23:01 HKT)
+
+- `resolve_worktree_path` now canonicalizes the deepest existing ancestor of the resolved target
+  (new helper `canonicalize_deepest_existing`) and performs the in-repo containment check on that
+  physically resolved form vs the canonical repo root. Fixes the lexical-vs-canonical mismatch that
+  let in-repo paths through behind symlinked prefixes (`/var`→`/private/var` TMPDIR fixtures,
+  symlinked checkouts). Returned path unchanged (lexical), so outside-repo behavior is untouched.
+- `documents_defect_in_repo_worktree_path_rejected` → regression
+  `in_repo_worktree_path_is_rejected_through_symlinked_temp_prefix` (red on macOS base, now green).
+- Added `in_repo_worktree_path_through_symlinked_repo_dir_is_rejected` (synthetic symlink, runs on
+  Linux) and `symlinked_repo_dir_default_template_still_resolves_outside` (outside default intact).
+- Gate (first fully green suite of the night): fmt PASS · bin 70/70 · cli 27/27 · clippy PASS.
 
 ## Milestone 1 — complete (22:55 HKT)
 
