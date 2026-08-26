@@ -1,10 +1,12 @@
 # Lucus overnight safety completion — result
 
 - **Base:** `d1eb5af60304fcfa248ddc5bd946ccd9eb13f66c` (`origin/main`, verified before any edit)
-- **Lane:** `lane/lucus-safety-overnight-local`, 8 local commits, no push, no history rewrite
-- **Finished:** 2026-08-26 15:20 UTC (23:20 HKT) — all milestones complete, deadline 23:00 UTC
-- **Final checks (all PASS):** `cargo fmt --all -- --check` · `cargo test --offline --all-targets`
-  (84 bin + 39 integration) · `cargo clippy --offline --all-targets -- -D warnings` · `git diff --check`
+- **Lane:** `lane/lucus-safety-overnight-local`, 12 commits at acceptance, no history rewrite
+- **Initial completion:** 2026-08-26 15:20 UTC (23:20 HKT) — all milestones complete before the deadline
+- **Cockpit acceptance:** 2026-08-27 07:44 HKT at `c08136a`, after post-review hardening and Linux verification
+- **Final checks (all PASS on macOS and Linux):** `cargo fmt --all -- --check` ·
+  `cargo test --offline --all-targets` (86 bin + 42 integration) ·
+  `cargo clippy --offline --all-targets -- -D warnings` · `git diff --check` · Chaperone strict review
 
 ## Acceptance predicates → tests → commits
 
@@ -105,6 +107,22 @@
   reads. No remaining force flags, implicit secret copying, unchecked traversal, or invalid
   NDJSON found. No new causally-connected defect; no fix required.
 
+## Post-review hardening — `c08136a`
+
+Cockpit review found that the initial rollback inferred copied names from configuration rather than
+recording successful copies. It could therefore remove a tracked destination or miss an ignored
+hook-created file. A direct probe also confirmed that `git worktree add` runs repository
+`post-checkout` hooks before Lucus copies files, so ordinary overwrite semantics could replace
+hook-created state.
+
+The accepted repair records each successful copy with its exact source and destination, includes
+ignored paths in rollback eligibility, plans every deletion before acting, revalidates attachment
+and branch tip, and refuses tracked or uncertain destinations. Copy sources must now be regular
+files, metadata errors other than `NotFound` propagate, and destinations use atomic no-clobber
+creation with streamed I/O. New regressions cover Unix sockets, exact copy records, tracked
+copy destinations, missing configured files followed by ignored hook output, and pre-copy
+`post-checkout` hook output.
+
 ## Unresolved risks (accepted, with reasoning)
 
 1. **TOCTOU windows are narrowed, not eliminated.** Ownership is revalidated immediately before
@@ -126,13 +144,11 @@
 7. **Hooks execute `sh -c` strings from user config** — a trusted-config capability by design;
    lucus only guarantees its own values arrive via environment variables, never interpolated.
 
-## Platform verification still needed before merge
+## Platform verification completed
 
-- **Linux run of the full offline suite.** The M2 symlink tests are written to be meaningful on
-  Linux (synthetic symlinks rather than `/private/var`), and the TMPDIR-prefix regression proves
-  the macOS case here, but the lane has only been executed on macOS 26 (rustc 1.97.1, git from
-  Xcode CLT). CI on Linux should confirm identical behavior of `git worktree prune`, `status
-  --porcelain` shapes, and the chmod-000 copy-failure fixture (which assumes a non-root user).
-- **macOS-only checks performed here that CI should preserve:** `/var`→`/private/var` canonical
-  mismatch regression, case-insensitive-filesystem tolerance of branch-derived paths (no defect
-  observed), and symlink-permissive `/tmp` fixture layouts.
+- **Linux:** the exact `c08136a` bundle passed the full offline fmt, 128-test, Clippy, and diff
+  checks on Ganglion (Linux 6.17, AArch64, rustc 1.98.0, Git 2.43.0). This exercised synthetic
+  symlink handling, `git worktree prune`, ignored-path porcelain output, the chmod-000 copy-failure
+  fixture, Unix sockets, and post-checkout hooks as a non-root user.
+- **macOS:** the same revision passed the full checks on macOS 26, including the
+  `/var`→`/private/var` canonical mismatch regression and symlink-permissive temporary layouts.

@@ -1,7 +1,7 @@
 # Lucus overnight safety completion — progress log
 
 - **Base SHA (verified, no drift):** `d1eb5af60304fcfa248ddc5bd946ccd9eb13f66c` = `origin/main`
-- **Lane:** `lane/lucus-safety-overnight-local` (local commits only, no push)
+- **Lane:** `lane/lucus-safety-overnight-local` (12 commits at acceptance; no history rewrite)
 - **Deadline:** 2026-08-27 07:00 HKT / 2026-08-26 23:00 UTC
 - **Session start:** 2026-08-26 22:38 HKT (14:38 UTC)
 
@@ -30,8 +30,14 @@
 
 ## Outcome
 
-8 commits on `lane/lucus-safety-overnight-local`, base `d1eb5af` (no drift, no rewrites, no push).
-All 8 defect-documenting tests converted to regressions; 123 tests green offline.
+The initial campaign completed eight implementation milestones plus its audit records before the
+deadline. Morning cockpit review then found two connected copy/rollback defects and one no-clobber
+hazard. `c08136a` closes them with exact successful-copy evidence, ignored-path detection,
+regular-file enforcement, atomic no-overwrite destinations, and fail-closed rollback planning.
+
+Final acceptance at 07:44 HKT: 12 commits from base `d1eb5af`, 128 tests green offline on macOS and
+Linux, Clippy warnings denied, diff-check clean, and Chaperone strict review passed. No history was
+rewritten.
 
 ## Milestone 7 — complete (23:47 HKT)
 
