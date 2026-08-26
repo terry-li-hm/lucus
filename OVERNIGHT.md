@@ -15,9 +15,23 @@
 - [x] 5. Branch/worktree ownership revalidation before removal
 - [x] 6. Stale worktree metadata recovery
 - [x] 7. Failed creation rollback
-- [ ] 8. Final adversarial audit + RESULT.md
+- [x] 8. Final adversarial audit + RESULT.md
 
-**Current milestone:** 8
+**Current milestone:** DONE — all 8 milestones complete, 23:20 HKT, ~7.7h before deadline
+
+## Milestone 8 — complete (23:21 HKT)
+
+- Re-read all 9 git subprocess sites, the `sh -c` hook boundary, and every filesystem boundary in
+  `src/`. No remaining force flags, missing `--` on user-controlled refs, implicit secret copying,
+  unchecked traversal, partial destructive sequences, stale-metadata failure, or invalid NDJSON.
+  No new causally-connected defect — no fix made (hardening-only `rev_parse --` noted in RESULT).
+- Final checks: fmt PASS · bin 84/84 · cli 39/39 · clippy -D warnings PASS · `git diff --check` PASS.
+- `RESULT.md` written: full predicate→test→commit map, unresolved risks, Linux verification notes.
+
+## Outcome
+
+8 commits on `lane/lucus-safety-overnight-local`, base `d1eb5af` (no drift, no rewrites, no push).
+All 8 defect-documenting tests converted to regressions; 123 tests green offline.
 
 ## Milestone 7 — complete (23:47 HKT)
 
