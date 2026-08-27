@@ -87,8 +87,15 @@ pub fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>> {
             // via `git worktree prune`.
             Err(_) => continue,
         };
-        let wt_repo = Repository::open(&path)
-            .with_context(|| format!("failed to open worktree repository for {name}"))?;
+        let Ok(wt_repo) = Repository::open(&path) else {
+            // The registered directory still exists but its linked-worktree
+            // `.git` file is broken (out-of-band damage), so the worktree
+            // cannot be opened as a repository. Skip the malformed
+            // registration so listings keep working; it is not stale — its
+            // directory is present — so never prune it, delete its branch,
+            // or touch its files.
+            continue;
+        };
         let branch = branch_for_repo(&wt_repo)?;
         entries.push(WorktreeEntry { branch, path });
     }
@@ -1058,6 +1065,97 @@ mod tests {
             "stale administrative metadata must be pruned"
         );
         branch_delete(repo.path(), "feat-gone", false).expect("cleanup branch");
+    }
+
+    /// Regression: a registered worktree whose directory is present but
+    /// whose linked-worktree `.git` file points at a broken target must not
+    /// brick listing or lookup for healthy worktrees. The malformed
+    /// directory is not stale (it exists), so it must not be pruned, and its
+    /// files and branch must remain untouched.
+    #[test]
+    fn list_and_find_survive_broken_gitfile_worktree() {
+        let repo = init_repo("broken-gitfile");
+        let healthy = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-healthy-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-healthy", &healthy).expect("worktree add healthy");
+        let malformed = repo.path().parent().unwrap().join(format!(
+            "lucus-wt-broken-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        worktree_add(repo.path(), "feat-broken", &malformed).expect("worktree add broken");
+        fs::write(malformed.join("precious.txt"), "keep me").expect("file in malformed worktree");
+
+        // Break only the gitfile target: the `.git` file points at a
+        // nonexistent administrative directory while the worktree directory
+        // itself stays present with its files.
+        let dot_git = malformed.join(".git");
+        let gitfile = fs::read_to_string(&dot_git).expect("gitfile should be readable");
+        let target = gitfile
+            .trim()
+            .strip_prefix("gitdir: ")
+            .expect("gitfile should carry a gitdir pointer");
+        let abs_target = if Path::new(target).is_absolute() {
+            PathBuf::from(target)
+        } else {
+            malformed.join(target)
+        };
+        assert!(
+            abs_target.exists(),
+            "gitdir target should exist before breakage"
+        );
+        fs::rename(&abs_target, abs_target.with_extension("broken")).expect("rename gitdir target");
+        assert!(dot_git.exists(), "directory and gitfile remain present");
+        assert!(
+            Repository::open(&malformed).is_err(),
+            "worktree is no longer openable"
+        );
+
+        let entries = list_worktrees(repo.path()).expect("list must not brick");
+        assert!(
+            entries.iter().any(|entry| entry.branch == "feat-healthy"),
+            "healthy linked worktree must still be listed"
+        );
+        assert_eq!(
+            find_worktree_by_branch(repo.path(), "feat-healthy").expect("find healthy"),
+            Some(healthy.canonicalize().expect("canonicalize healthy"))
+        );
+        assert_eq!(
+            find_worktree_by_branch(repo.path(), "feat-broken").expect("find broken"),
+            None,
+            "malformed registration must not resolve"
+        );
+
+        // The malformed directory and its files are preserved, not pruned.
+        assert!(malformed.exists(), "malformed directory must remain");
+        assert_eq!(
+            fs::read_to_string(malformed.join("precious.txt")).expect("precious file"),
+            "keep me"
+        );
+        assert!(
+            stale_worktrees(repo.path()).expect("stale").is_empty(),
+            "a present directory is never stale"
+        );
+        prune_stale_worktrees(repo.path()).expect("prune");
+        assert!(
+            malformed.exists(),
+            "prune must not remove the malformed worktree"
+        );
+        assert!(
+            branch_exists(repo.path(), "feat-broken"),
+            "branch must survive"
+        );
+
+        // Restore the gitdir target and clean up so the TestDir drop works.
+        fs::rename(abs_target.with_extension("broken"), &abs_target)
+            .expect("restore gitdir target");
+        worktree_remove(repo.path(), &malformed, true).expect("cleanup malformed");
+        branch_delete(repo.path(), "feat-broken", false).expect("cleanup broken branch");
+        worktree_remove(repo.path(), &healthy, false).expect("cleanup healthy");
+        branch_delete(repo.path(), "feat-healthy", false).expect("cleanup healthy branch");
     }
 
     #[test]
