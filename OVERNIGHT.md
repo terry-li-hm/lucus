@@ -1,7 +1,7 @@
 # Lucus overnight safety completion — progress log
 
 - **Base SHA (verified, no drift):** `d1eb5af60304fcfa248ddc5bd946ccd9eb13f66c` = `origin/main`
-- **Lane:** `lane/lucus-safety-overnight-local` (12 commits at acceptance; no history rewrite)
+- **Lane:** overnight lane plus focused installed-surface follow-up (14 commits at final acceptance; no history rewrite)
 - **Deadline:** 2026-08-27 07:00 HKT / 2026-08-26 23:00 UTC
 - **Session start:** 2026-08-26 22:38 HKT (14:38 UTC)
 
@@ -35,9 +35,10 @@ deadline. Morning cockpit review then found two connected copy/rollback defects 
 hazard. `c08136a` closes them with exact successful-copy evidence, ignored-path detection,
 regular-file enforcement, atomic no-overwrite destinations, and fail-closed rollback planning.
 
-Final acceptance at 07:44 HKT: 12 commits from base `d1eb5af`, 128 tests green offline on macOS and
-Linux, Clippy warnings denied, diff-check clean, and Chaperone strict review passed. No history was
-rewritten.
+Final acceptance at 08:03 HKT: 14 commits from base `d1eb5af`, 129 tests green offline on macOS and
+Linux, Clippy warnings denied, diff-check clean, and Chaperone strict review passed. A live installed-binary
+smoke also proved that an unrelated existing directory with a broken linked-worktree gitfile no longer
+bricks healthy `list` or `query`. No history was rewritten.
 
 ## Milestone 7 — complete (23:47 HKT)
 

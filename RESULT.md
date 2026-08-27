@@ -1,11 +1,11 @@
 # Lucus overnight safety completion — result
 
 - **Base:** `d1eb5af60304fcfa248ddc5bd946ccd9eb13f66c` (`origin/main`, verified before any edit)
-- **Lane:** `lane/lucus-safety-overnight-local`, 12 commits at acceptance, no history rewrite
+- **Lane:** `lane/lucus-safety-overnight-local` plus one focused follow-up, 14 commits at final acceptance, no history rewrite
 - **Initial completion:** 2026-08-26 15:20 UTC (23:20 HKT) — all milestones complete before the deadline
-- **Cockpit acceptance:** 2026-08-27 07:44 HKT at `c08136a`, after post-review hardening and Linux verification
+- **Final cockpit acceptance:** 2026-08-27 08:03 HKT at `acc05f4`, after post-review hardening, installed-surface repair, and Linux verification
 - **Final checks (all PASS on macOS and Linux):** `cargo fmt --all -- --check` ·
-  `cargo test --offline --all-targets` (86 bin + 42 integration) ·
+  `cargo test --offline --all-targets` (87 bin + 42 integration) ·
   `cargo clippy --offline --all-targets -- -D warnings` · `git diff --check` · Chaperone strict review
 
 ## Acceptance predicates → tests → commits
@@ -123,6 +123,16 @@ creation with streamed I/O. New regressions cover Unix sockets, exact copy recor
 copy destinations, missing configured files followed by ignored hook output, and pre-copy
 `post-checkout` hook output.
 
+## Installed-surface follow-up — `acc05f4`
+
+The rebuilt binary exposed one further live defect: an unrelated registered worktree whose directory
+still existed but whose linked `.git` target was broken caused `list`, `query`, and `remove` to fail
+for every healthy branch. Lucus now skips that malformed registration during listing without
+classifying it as stale, pruning it, or touching its directory, files, or branch. A synthetic
+regression preserves a sentinel file and branch while proving healthy lookup remains available.
+The exact revision passed the full 129-test suite and Clippy on macOS and Linux, then passed a live
+`list` and `query main` smoke against the previously blocking Germline registration.
+
 ## Unresolved risks (accepted, with reasoning)
 
 1. **TOCTOU windows are narrowed, not eliminated.** Ownership is revalidated immediately before
@@ -146,7 +156,7 @@ copy destinations, missing configured files followed by ignored hook output, and
 
 ## Platform verification completed
 
-- **Linux:** the exact `c08136a` bundle passed the full offline fmt, 128-test, Clippy, and diff
+- **Linux:** the exact `acc05f4` bundle passed the full offline fmt, 129-test, Clippy, and diff
   checks on Ganglion (Linux 6.17, AArch64, rustc 1.98.0, Git 2.43.0). This exercised synthetic
   symlink handling, `git worktree prune`, ignored-path porcelain output, the chmod-000 copy-failure
   fixture, Unix sockets, and post-checkout hooks as a non-root user.
