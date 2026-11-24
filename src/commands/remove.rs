@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 
 use crate::config::Config;
 use crate::git;
@@ -22,7 +22,11 @@ pub fn run(config: &Config, branch: &str, force: bool) -> Result<()> {
                 // git refuses to delete a branch still used by a registered
                 // worktree, so prune the (already dead) registration first.
                 // The branch delete below keeps its merged-state protection.
+                if !force {
+                    git::ensure_branch_merged(&repo_root, branch)?;
+                }
                 git::prune_stale_worktrees(&repo_root)?;
+                matched.ensure_pruned(&repo_root)?;
                 eprintln!(
                     "pruned stale worktree registration '{}' for branch {branch}; the working directory was already missing",
                     matched.name
@@ -56,9 +60,24 @@ pub fn run(config: &Config, branch: &str, force: bool) -> Result<()> {
     // revalidate ownership before any destructive step.
     git::ensure_worktree_attached_to_branch(&repo_root, &path, branch)?;
 
+    if !force {
+        git::ensure_branch_merged(&repo_root, branch)?;
+        git::ensure_clean_for_removal(&path)?;
+        git::ensure_worktree_attached_to_branch(&repo_root, &path, branch)?;
+    }
     git::worktree_remove(&repo_root, &path, force)?;
-    git::branch_delete(&repo_root, branch, force)?;
-    hooks::run_blocking(&config.hooks.post_remove, &hook_context)?;
+    git::branch_delete(&repo_root, branch, force).with_context(|| {
+        format!(
+            "removed worktree {} but branch deletion failed for {branch}; post_remove not run",
+            path.display()
+        )
+    })?;
+    hooks::run_blocking(&config.hooks.post_remove, &hook_context).with_context(|| {
+        format!(
+            "removed worktree {} and deleted branch {branch}, but post_remove failed",
+            path.display()
+        )
+    })?;
 
     eprintln!(
         "removed worktree {} and deleted branch {}",

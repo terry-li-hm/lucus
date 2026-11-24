@@ -298,6 +298,30 @@ pub struct StaleWorktree {
     pub branch: Option<String>,
 }
 
+impl StaleWorktree {
+    /// Prune may succeed without removing a locked registration. Check the
+    /// exact admin entry, not the stale list (a checkout can reappear).
+    pub fn ensure_pruned(&self, repo_root: &Path) -> Result<()> {
+        let admin = Identity::open(repo_root)?
+            .common
+            .join("worktrees")
+            .join(&self.name);
+        match fs::symlink_metadata(admin) {
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+            Ok(_) => anyhow::bail!(
+                "worktree registration '{}' was retained; no branch deletion was attempted",
+                self.name
+            ),
+            Err(err) => Err(err).with_context(|| {
+                format!(
+                    "cannot verify prune of registration '{}'; no branch deletion was attempted",
+                    self.name
+                )
+            }),
+        }
+    }
+}
+
 /// List registered worktrees whose directories are missing.
 ///
 /// The branch is read from the worktree's administrative `HEAD` file, which
@@ -769,6 +793,116 @@ pub fn worktree_remove(repo_root: &Path, path: &Path, force: bool) -> Result<()>
     ensure!(
         output.status.success(),
         "git worktree remove failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
+/// Native `worktree remove` treats ignored files as disposable. Require a
+/// completely clean status instead; don't parse or decode pathnames. Warnings
+/// (e.g. an unreadable directory) can accompany a successful but partial scan.
+pub fn ensure_clean_for_removal(path: &Path) -> Result<()> {
+    let target = Identity::open(path)?;
+    target.pin_target()?;
+    let output = target
+        .command()?
+        .args([
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            // Don't collapse distinct filenames on a case-sensitive volume.
+            "-c",
+            "core.ignoreCase=false",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--ignored=matching",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ])
+        .output()
+        .context("failed to inspect worktree before removal")?;
+    ensure!(
+        output.status.success() && output.stderr.is_empty(),
+        "cannot verify clean status at {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    ensure!(
+        output.stdout.is_empty(),
+        "worktree {} has uncommitted, untracked or ignored data; refusing removal",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Read an exact ref's object ID and its Git-mapped tracking ref (not the
+/// remote-side merge name). Only a successful, empty lookup means absent.
+fn ref_and_upstream(root: &Path, name: &str) -> Result<Option<(String, String)>> {
+    // for-each-ref doesn't enumerate pseudo-refs such as ORIG_HEAD. An
+    // unsupported upstream spelling is not evidence of a missing ref.
+    ensure!(name.starts_with("refs/"), "cannot verify merge ref {name}");
+    let output = git_command(root)?
+        .args([
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00%(upstream)",
+            "--",
+            name,
+        ])
+        .output()
+        .context("cannot inspect branch merge policy")?;
+    ensure!(
+        output.status.success() && output.stderr.is_empty(),
+        "cannot inspect ref {name}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    if output.stdout.is_empty() {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(&output.stdout)?;
+    let mut fields = text
+        .strip_suffix('\n')
+        .context("incomplete ref record")?
+        .split('\0');
+    ensure!(fields.next() == Some(name), "expected exact ref {name}");
+    let oid = fields.next().context("missing ref object ID")?;
+    let upstream = fields.next().context("missing upstream field")?;
+    ensure!(
+        fields.next().is_none() && !oid.is_empty(),
+        "unexpected ref record for {name}"
+    );
+    Ok(Some((oid.to_owned(), upstream.to_owned())))
+}
+
+/// Match `branch -d`: use the upstream if it exists, or the invoking
+/// checkout's HEAD (never the target checkout's HEAD) otherwise.
+pub fn ensure_branch_merged(repo_root: &Path, branch: &str) -> Result<()> {
+    let (tip, upstream) = ref_and_upstream(repo_root, &format!("refs/heads/{branch}"))?
+        .with_context(|| format!("cannot find branch {branch}"))?;
+    let tracking = if upstream.is_empty() {
+        None
+    } else {
+        ref_and_upstream(repo_root, &upstream)?
+    };
+    let reference = tracking.as_ref().map_or("HEAD", |(oid, _)| oid);
+    let output = git_command(repo_root)?
+        .args(["merge-base", "--is-ancestor", &tip, reference])
+        .output()
+        .context("cannot check branch ancestry")?;
+    ensure!(
+        output.status.code() != Some(1),
+        "branch {branch} is not fully merged into {}; refusing removal",
+        if tracking.is_some() {
+            &upstream
+        } else {
+            "HEAD"
+        }
+    );
+    ensure!(
+        output.status.success() && output.stderr.is_empty(),
+        "cannot verify merge state of {branch}: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
     Ok(())

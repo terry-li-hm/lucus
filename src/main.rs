@@ -34,9 +34,15 @@ enum Command {
     List,
 
     /// Remove a worktree and delete its branch.
+    ///
+    /// Keep other writers out during removal: the status and merge checks are
+    /// not atomic with deletion. Concurrent changes can be lost.
     Remove {
         branch: String,
-        #[arg(long, help = "Remove even if the worktree has uncommitted changes")]
+        #[arg(
+            long,
+            help = "Discard uncommitted changes, ignored files and unmerged work"
+        )]
         force: bool,
     },
 

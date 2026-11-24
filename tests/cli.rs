@@ -805,7 +805,7 @@ fn remove_dirty_without_force_fails_and_keeps_branch() {
     let output = fx.lucus(&["remove", "feat-dirty"]);
     let code = assert_failure(&output);
     assert_eq!(code, 1);
-    assert!(stderr(&output).contains("git worktree remove failed"));
+    assert!(stderr(&output).contains("uncommitted, untracked or ignored data"));
     assert!(Path::new(&path).exists());
     assert!(branch_exists(&fx, "feat-dirty"));
 }
@@ -823,7 +823,201 @@ fn remove_dirty_with_force_succeeds() {
     assert!(!branch_exists(&fx, "feat-force"));
 }
 
-/// `lucus remove` without `--force` uses `git branch -d` and refuses to
+fn new_topic(fx: &Fixture) -> PathBuf {
+    let output = fx.lucus(&["new", "topic"]);
+    assert_success(&output);
+    PathBuf::from(stdout(&output).trim())
+}
+
+#[test]
+fn remove_preserves_ignored_data_without_force() {
+    let fx = Fixture::new("remove-ignored");
+    fs::write(fx.repo.join(".git/info/exclude"), ".local\ncache/\n").unwrap();
+    fx.write_config("[files]\ncopy = ['.local']\n");
+    fs::write(fx.repo.join(".local"), b"\xffcopy\0").unwrap();
+    let path = new_topic(&fx);
+    fs::create_dir_all(path.join("nested/cache")).unwrap();
+    fs::write(path.join("nested/cache/local"), b"\0only here\n").unwrap();
+    let before = snapshot(&fx);
+    let output = fx.lucus(&["remove", "topic"]);
+    assert_failure(&output);
+    assert!(stderr(&output).contains("ignored data"));
+    assert_eq!(snapshot(&fx), before);
+    assert!(path.is_dir());
+    assert_eq!(fs::read(path.join(".local")).unwrap(), b"\xffcopy\0");
+    assert_eq!(
+        fs::read(path.join("nested/cache/local")).unwrap(),
+        b"\0only here\n"
+    );
+}
+
+#[test]
+fn remove_preserves_ignored_case_variant() {
+    let fx = Fixture::new("remove-ignore-case");
+    let path = new_topic(&fx);
+    let variant = path.join("readme.md");
+    if variant.try_exists().unwrap() {
+        // The filesystem aliases this spelling to the tracked README.md.
+        return;
+    }
+    git(&path, &fx.root, &["config", "core.ignoreCase", "true"]);
+    fs::write(fx.repo.join(".git/info/exclude"), "/readme.md\n").unwrap();
+    fs::write(&variant, b"ignored sibling\0\xff").unwrap();
+    let before = snapshot(&fx);
+    let output = fx.lucus(&["remove", "topic"]);
+    assert_failure(&output);
+    assert!(
+        stderr(&output).contains("ignored data"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(snapshot(&fx), before);
+    assert_eq!(fs::read(variant).unwrap(), b"ignored sibling\0\xff");
+    assert_eq!(fs::read(path.join("README.md")).unwrap(), b"hello\n");
+}
+
+#[test]
+fn remove_explicit_force_can_remove_ignored_fixture() {
+    let fx = Fixture::new("force-ignored");
+    let path = new_topic(&fx);
+    fs::write(fx.repo.join(".git/info/exclude"), "local\n").unwrap();
+    fs::write(path.join("local"), "ignored").unwrap();
+    assert_success(&fx.lucus(&["remove", "--force", "topic"]));
+    assert!(!path.exists());
+    assert!(!branch_exists(&fx, "topic"));
+}
+
+#[test]
+fn remove_preserves_ignored_data_from_pre_remove() {
+    let fx = Fixture::new("hook-ignored");
+    let path = new_topic(&fx);
+    fs::write(fx.repo.join(".git/info/exclude"), "local\n").unwrap();
+    fx.write_config(
+        r#"[hooks]
+pre_remove = ['printf hook > "$LUCUS_WORKTREE_PATH/local"']
+"#,
+    );
+    let output = fx.lucus(&["remove", "topic"]);
+    assert_failure(&output);
+    assert!(stderr(&output).contains("ignored data"));
+    assert_eq!(fs::read(path.join("local")).unwrap(), b"hook");
+    assert!(branch_exists(&fx, "topic"));
+}
+
+#[test]
+fn remove_uses_branch_upstream_merge_policy() {
+    let fx = Fixture::new("remove-upstream");
+    let tracking = "refs/remotes/origin/server-topic";
+    git(&fx.repo, &fx.root, &["update-ref", tracking, "HEAD"]);
+    git(
+        &fx.repo,
+        &fx.root,
+        &["commit", "--allow-empty", "-m", "main advanced"],
+    );
+    let path = new_topic(&fx);
+    git(&fx.repo, &fx.root, &["remote", "add", "origin", "."]);
+    git(
+        &path,
+        &fx.root,
+        &["branch", "--set-upstream-to=origin/server-topic"],
+    );
+
+    // Merged into main, but not the actual tracking ref.
+    let before = snapshot(&fx);
+    let output = fx.lucus(&["remove", "topic"]);
+    assert_failure(&output);
+    assert!(stderr(&output).contains(tracking));
+    assert_eq!(snapshot(&fx), before);
+    assert_eq!(fs::read(path.join("README.md")).unwrap(), b"hello\n");
+
+    // Now merged into the tracking ref, but not main.
+    git(
+        &path,
+        &fx.root,
+        &["commit", "--allow-empty", "-m", "topic advanced"],
+    );
+    git(&path, &fx.root, &["update-ref", tracking, "HEAD"]);
+    assert_success(&fx.lucus(&["remove", "topic"]));
+    assert!(!path.exists());
+    assert!(!branch_exists(&fx, "topic"));
+}
+
+#[test]
+fn remove_with_missing_upstream_uses_origin_head() {
+    let fx = Fixture::new("remove-upstream-gone");
+    let path = new_topic(&fx);
+    git(&path, &fx.root, &["branch", "upstream"]);
+    git(&path, &fx.root, &["branch", "--set-upstream-to=upstream"]);
+    git(&path, &fx.root, &["branch", "-d", "upstream"]);
+    git(
+        &path,
+        &fx.root,
+        &["commit", "--allow-empty", "-m", "topic advanced"],
+    );
+    assert_failure(&fx.lucus(&["remove", "topic"]));
+    assert!(path.is_dir());
+    git(&fx.repo, &fx.root, &["merge", "--ff-only", "topic"]);
+    assert_success(&fx.lucus(&["remove", "topic"]));
+}
+
+#[test]
+fn remove_refuses_indeterminate_checkout_status() {
+    let fx = Fixture::new("remove-status-failure");
+    let path = new_topic(&fx);
+    let index = git(
+        &path,
+        &fx.root,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    );
+    fs::write(stdout(&index).trim(), b"invalid index").unwrap();
+    let output = fx.lucus(&["remove", "topic"]);
+    assert_failure(&output);
+    assert!(
+        stderr(&output).contains("cannot verify clean status"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(fs::read(path.join("README.md")).unwrap(), b"hello\n");
+    assert!(branch_exists(&fx, "topic"));
+}
+
+#[test]
+fn remove_reports_branch_delete_failure_after_worktree_removal() {
+    let fx = Fixture::new("remove-locked-ref");
+    let path = new_topic(&fx);
+    fs::write(fx.repo.join(".git/refs/heads/topic.lock"), "locked").unwrap();
+    fx.write_config(
+        r#"[hooks]
+post_remove = ['touch "$HOME/ran-post-remove"']
+"#,
+    );
+    let output = fx.lucus(&["remove", "topic"]);
+    assert_failure(&output);
+    assert!(stderr(&output).contains(&format!(
+        "removed worktree {} but branch deletion failed for topic; post_remove not run",
+        path.display()
+    )));
+    assert!(!path.exists());
+    assert!(branch_exists(&fx, "topic"));
+    assert!(!fx.root.join("ran-post-remove").exists());
+}
+
+#[test]
+fn remove_reports_exact_partial_outcome() {
+    let fx = Fixture::new("remove-partial");
+    let path = new_topic(&fx);
+    fx.write_config("[hooks]\npost_remove = ['exit 17']\n");
+    let output = fx.lucus(&["remove", "topic"]);
+    assert_failure(&output);
+    assert!(stderr(&output).contains(&format!(
+        "removed worktree {} and deleted branch topic, but post_remove failed",
+        path.display()
+    )));
+    assert!(!path.exists());
+    assert!(!branch_exists(&fx, "topic"));
+}
+
+/// `lucus remove` without `--force` preflights `git branch -d` and refuses to
 /// delete a branch that still has unique commits.
 #[test]
 fn remove_without_force_refuses_unmerged_branch() {
@@ -841,11 +1035,16 @@ fn remove_without_force_refuses_unmerged_branch() {
     let code = assert_failure(&output);
     assert_eq!(code, 1);
     assert!(
-        stderr(&output).contains("git branch -d failed"),
+        stderr(&output).contains("not fully merged into HEAD"),
         "unexpected stderr:\n{}",
         stderr(&output)
     );
     assert!(branch_exists(&fx, "feat-unique"));
+    assert!(Path::new(&path).is_dir());
+    assert_eq!(
+        fs::read(Path::new(&path).join("unique.txt")).unwrap(),
+        b"only-here"
+    );
 
     let mut cat_cmd = Command::new("git");
     cat_cmd
@@ -1017,6 +1216,34 @@ fn list_query_and_remove_survive_out_of_band_directory_loss() {
     assert_success(&again);
 }
 
+#[test]
+fn stale_worktree_recovery_reports_locked_registration_retained() {
+    let fx = Fixture::new("stale-locked");
+    let path = new_topic(&fx);
+    git(
+        &fx.repo,
+        &fx.root,
+        &["worktree", "lock", path.to_str().unwrap()],
+    );
+    fs::remove_dir_all(path).unwrap();
+    let before = snapshot(&fx);
+    for args in [&["remove", "topic"][..], &["remove", "--force", "topic"]] {
+        let output = fx.lucus(args);
+        assert_failure(&output);
+        let message = stderr(&output);
+        assert!(
+            message.contains("was retained; no branch deletion was attempted"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("pruned stale worktree registration"),
+            "{message}"
+        );
+        assert_eq!(snapshot(&fx), before);
+        assert!(branch_exists(&fx, "topic"));
+    }
+}
+
 /// Regression: recovery of a stale worktree for a branch with unique commits
 /// still refuses to discard them without `--force`.
 #[test]
@@ -1032,16 +1259,13 @@ fn stale_worktree_recovery_refuses_to_delete_unmerged_branch() {
     let sha = String::from_utf8_lossy(&head.stdout).trim().to_owned();
     fs::remove_dir_all(&path).expect("out-of-band directory loss");
 
+    let before = snapshot(&fx);
     let output = fx.lucus(&["remove", "feat-stale-unique"]);
     let code = assert_failure(&output);
     assert_eq!(code, 1);
+    assert_eq!(snapshot(&fx), before, "preflight precedes prune");
     assert!(
-        stderr(&output).contains("pruned stale worktree registration"),
-        "unexpected stderr: {}",
-        stderr(&output)
-    );
-    assert!(
-        stderr(&output).contains("git branch -d failed"),
+        stderr(&output).contains("not fully merged into HEAD"),
         "merged-state protection must apply in recovery: {}",
         stderr(&output)
     );
