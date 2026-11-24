@@ -11,7 +11,12 @@ use std::process::ExitCode;
 use crate::commands::query::BranchRef;
 
 #[derive(Debug, Parser)]
-#[command(name = "lucus", version, about = "Git worktree manager")]
+#[command(
+    name = "lucus",
+    version,
+    about = "Git worktree manager",
+    after_help = "Repository commands require an unambiguous Git context. Unset Git repository, worktree, index, object/ref routing, discovery and config overrides (including GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR, GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY, GIT_ALTERNATE_OBJECT_DIRECTORIES, GIT_CONFIG and GIT_CONFIG_*). Use the desired checkout as your working directory."
+)]
 struct Cli {
     #[arg(long, global = true)]
     json: bool,
@@ -62,6 +67,9 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    if !matches!(cli.command, Command::Init { .. }) {
+        git::check_environment()?;
+    }
     match cli.command {
         Command::List => {
             let format = output::detect_format(cli.json);

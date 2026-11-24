@@ -4,6 +4,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::files::CopiedFile;
 
@@ -20,26 +21,195 @@ pub struct WorktreeStats {
     pub uncommitted: u32,
 }
 
+/// Reject even empty selectors: presence can change Git's discovery or routing.
+/// Other environment (including author identity and hook environment) is inherited.
+pub fn check_environment() -> Result<()> {
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        let selector = key.starts_with("GIT_CONFIG_")
+            || matches!(
+                key.as_ref(),
+                "GIT_CONFIG"
+                    | "GIT_DIR"
+                    | "GIT_COMMON_DIR"
+                    | "GIT_WORK_TREE"
+                    | "GIT_IMPLICIT_WORK_TREE"
+                    | "GIT_INDEX_FILE"
+                    | "GIT_OBJECT_DIRECTORY"
+                    | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+                    | "GIT_QUARANTINE_PATH"
+                    | "GIT_NAMESPACE"
+                    | "GIT_GRAFT_FILE"
+                    | "GIT_SHALLOW_FILE"
+                    | "GIT_REPLACE_REF_BASE"
+                    | "GIT_NO_REPLACE_OBJECTS"
+                    | "GIT_PREFIX"
+                    | "GIT_CEILING_DIRECTORIES"
+                    | "GIT_DISCOVERY_ACROSS_FILESYSTEM"
+                    | "GIT_EXEC_PATH"
+            );
+        ensure!(
+            !selector,
+            "unsupported Git context override: unset {key} before running lucus"
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Identity {
+    common: PathBuf,
+    admin: PathBuf,
+    root: PathBuf,
+}
+
+// Each CLI invocation operates on one repository and at most one target.
+// Retain their original identities across hook boundaries: neither a fresh
+// branch lookup nor a matching path is proof of the same registration.
+struct Invocation {
+    origin: Identity,
+    target: OnceLock<Identity>,
+}
+static INVOCATION: OnceLock<Invocation> = OnceLock::new();
+
+fn git_at(path: &Path) -> Result<Command> {
+    check_environment()?;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(path);
+    Ok(cmd)
+}
+
+impl Identity {
+    fn verified(repo: &Repository, at: &Path) -> Result<Self> {
+        let id = Self {
+            common: repo.commondir().canonicalize()?,
+            admin: repo.path().canonicalize()?,
+            root: repo
+                .workdir()
+                .context("repository has no working directory")?
+                .canonicalize()?,
+        };
+        if repo.is_worktree() {
+            let registered = git2::Worktree::open_from_repository(repo)?;
+            ensure!(
+                registered.path().canonicalize()? == id.root,
+                "linked worktree registration disagrees with checkout at {}",
+                at.display()
+            );
+        }
+        let output = git_at(at)?
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+                "--absolute-git-dir",
+                "--show-toplevel",
+            ])
+            .output()
+            .context("failed to verify Git repository context")?;
+        // Compare native path bytes, not trimmed/lossy strings. A different
+        // admin dir can mean a different HEAD and index in the same repo.
+        let mut expected = Vec::new();
+        for path in [&id.common, &id.admin, &id.root] {
+            let bytes = path.as_os_str().as_encoded_bytes();
+            ensure!(
+                !bytes.contains(&b'\n'),
+                "cannot verify a Git context path containing a newline"
+            );
+            expected.extend_from_slice(bytes);
+            expected.push(b'\n');
+        }
+        ensure!(
+            output.status.success() && output.stdout == expected,
+            "Git repository context mismatch at {}; refusing to proceed",
+            at.display()
+        );
+        Ok(id)
+    }
+
+    fn at_root(path: &Path, repo: &Repository) -> Result<Self> {
+        let id = Self::verified(repo, path)?;
+        ensure!(
+            id.root == path.canonicalize()?,
+            "unexpected worktree at {}",
+            path.display()
+        );
+        if let Some(ctx) = INVOCATION.get() {
+            let origin = &ctx.origin;
+            ensure!(
+                id.common == origin.common && (path != origin.root || &id == origin),
+                "Git repository context changed at {}; refusing to proceed",
+                path.display()
+            );
+        }
+        Ok(id)
+    }
+
+    fn open(path: &Path) -> Result<Self> {
+        Self::at_root(path, &Repository::open(path)?)
+    }
+
+    fn linked_target(&self, path: &Path, repo: &Repository) -> Result<Self> {
+        let target = Self::at_root(path, repo)?;
+        ensure!(
+            repo.is_worktree()
+                && target.common == self.common
+                && target.admin.parent() == Some(&self.common.join("worktrees")),
+            "unexpected linked worktree context at {}",
+            path.display()
+        );
+        Ok(target)
+    }
+
+    fn pin_target(&self) -> Result<()> {
+        if let Some(ctx) = INVOCATION.get() {
+            ensure!(
+                ctx.target.get_or_init(|| self.clone()) == self,
+                "worktree registration changed at {}; refusing to proceed",
+                self.root.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn command(&self) -> Result<Command> {
+        let mut command = git_at(&self.root)?;
+        command
+            .arg("--git-dir")
+            .arg(&self.admin)
+            .arg("--work-tree")
+            .arg(&self.root);
+        Ok(command)
+    }
+}
+
+fn git_command(path: &Path) -> Result<Command> {
+    Identity::open(path)?.command()
+}
+
 pub fn repo_root_from_cwd() -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to read current directory")?;
     let repo = Repository::discover(&cwd).context("not inside a git repository")?;
-    let root = repo
-        .workdir()
-        .ok_or_else(|| anyhow!("repository has no working directory"))?;
-    root.canonicalize()
-        .with_context(|| format!("failed to canonicalize repo root: {}", root.display()))
+    let origin = Identity::verified(&repo, &cwd)?;
+    let root = origin.root.clone();
+    INVOCATION
+        .set(Invocation {
+            origin,
+            target: OnceLock::new(),
+        })
+        .map_err(|_| anyhow!("repository context already initialized"))?;
+    Ok(root)
 }
 
 pub fn current_branch(repo_root: &Path) -> Result<String> {
     let repo = Repository::open(repo_root)
         .with_context(|| format!("failed to open repository at {}", repo_root.display()))?;
+    Identity::at_root(repo_root, &repo)?;
     branch_for_repo(&repo)
 }
 
 pub fn previous_branch(repo_root: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let output = git_command(repo_root)?
         .args(["rev-parse", "--abbrev-ref", "@{-1}"])
         .output()
         .with_context(|| {
@@ -56,24 +226,12 @@ pub fn previous_branch(repo_root: &Path) -> Result<String> {
     Ok(value)
 }
 
-pub fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>> {
+fn verified_worktrees(repo_root: &Path) -> Result<Vec<(String, Identity)>> {
     let repo = Repository::open(repo_root)
         .with_context(|| format!("failed to open repository at {}", repo_root.display()))?;
 
-    let mut entries = Vec::new();
-
-    if let Some(main_workdir) = repo.workdir() {
-        let branch = branch_for_repo(&repo)?;
-        entries.push(WorktreeEntry {
-            branch,
-            path: main_workdir.canonicalize().with_context(|| {
-                format!(
-                    "failed to canonicalize workdir path {}",
-                    main_workdir.display()
-                )
-            })?,
-        });
-    }
+    let origin = Identity::at_root(repo_root, &repo)?;
+    let mut entries = vec![(branch_for_repo(&repo)?, origin.clone())];
 
     let worktrees = repo.worktrees().context("failed to list worktrees")?;
     for name in worktrees.iter().flatten() {
@@ -96,22 +254,41 @@ pub fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>> {
             // or touch its files.
             continue;
         };
+        let identity = Identity::at_root(&path, &wt_repo)?;
+        ensure!(
+            identity.common == origin.common
+                && identity.admin == origin.common.join("worktrees").join(name),
+            "registered worktree context mismatch at {}",
+            path.display()
+        );
         let branch = branch_for_repo(&wt_repo)?;
-        entries.push(WorktreeEntry { branch, path });
+        entries.push((branch, identity));
     }
 
-    entries.sort_by(|left, right| left.branch.cmp(&right.branch));
-    entries.dedup_by(|left, right| left.path == right.path);
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries.dedup();
 
     Ok(entries)
 }
 
-pub fn find_worktree_by_branch(repo_root: &Path, branch: &str) -> Result<Option<PathBuf>> {
-    let entries = list_worktrees(repo_root)?;
-    Ok(entries
+pub fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>> {
+    Ok(verified_worktrees(repo_root)?
         .into_iter()
-        .find(|entry| entry.branch == branch)
-        .map(|entry| entry.path))
+        .map(|(branch, id)| WorktreeEntry {
+            branch,
+            path: id.root,
+        })
+        .collect())
+}
+
+pub fn find_worktree_by_branch(repo_root: &Path, branch: &str) -> Result<Option<PathBuf>> {
+    for (name, identity) in verified_worktrees(repo_root)? {
+        if name == branch {
+            identity.pin_target()?;
+            return Ok(Some(identity.root));
+        }
+    }
+    Ok(None)
 }
 
 /// A registered worktree whose working directory no longer exists.
@@ -130,6 +307,7 @@ pub fn stale_worktrees(repo_root: &Path) -> Result<Vec<StaleWorktree>> {
     let repo = Repository::open(repo_root)
         .with_context(|| format!("failed to open repository at {}", repo_root.display()))?;
 
+    Identity::at_root(repo_root, &repo)?;
     let mut stale = Vec::new();
     for name in repo
         .worktrees()
@@ -153,7 +331,7 @@ pub fn stale_worktrees(repo_root: &Path) -> Result<Vec<StaleWorktree>> {
 }
 
 fn read_worktree_admin_head_branch(repo: &Repository, name: &str) -> Option<String> {
-    let head_path = repo.path().join("worktrees").join(name).join("HEAD");
+    let head_path = repo.commondir().join("worktrees").join(name).join("HEAD");
     let head = fs::read_to_string(head_path).ok()?;
     let branch = head.trim().strip_prefix("ref: refs/heads/")?;
     Some(branch.to_owned())
@@ -165,9 +343,7 @@ fn read_worktree_admin_head_branch(repo: &Repository, name: &str) -> Option<Stri
 /// metadata for directories that no longer exist — it never deletes a live
 /// directory or a branch.
 pub fn prune_stale_worktrees(repo_root: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let output = git_command(repo_root)?
         .args(["worktree", "prune"])
         .output()
         .with_context(|| {
@@ -187,9 +363,7 @@ pub fn prune_stale_worktrees(repo_root: &Path) -> Result<()> {
 
 /// Read a commit id (or any revision) via `git rev-parse --verify`.
 pub fn rev_parse(repo_root: &Path, revision: &str) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let output = git_command(repo_root)?
         .args(["rev-parse", "--verify"])
         .arg(revision)
         .output()
@@ -213,9 +387,7 @@ pub fn rev_parse(repo_root: &Path, revision: &str) -> Result<String> {
 /// Ignored paths are included: a hook-created ignored file is state that a
 /// rollback must see before deciding the worktree holds nothing unique.
 pub fn dirty_paths(worktree_path: &Path) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
+    let output = git_command(worktree_path)?
         .args(["status", "--porcelain", "--ignored"])
         .output()
         .with_context(|| {
@@ -363,6 +535,7 @@ pub fn rollback_clean_creation(
         planned.push(destination.clone());
     }
 
+    ensure_worktree_attached_to_branch(repo_root, worktree_path, branch)?;
     for destination in planned {
         fs::remove_file(&destination).with_context(|| {
             format!(
@@ -378,9 +551,7 @@ pub fn rollback_clean_creation(
 
 /// Whether `relative` inside `worktree_path` is tracked by git.
 fn is_tracked(worktree_path: &Path, relative: &Path) -> Result<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
+    let output = git_command(worktree_path)?
         .args(["ls-files", "--"])
         .arg(relative)
         .output()
@@ -435,9 +606,7 @@ pub fn ensure_worktree_attached_to_branch(
 }
 
 pub fn worktree_stats(worktree_path: &Path) -> Result<WorktreeStats> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(worktree_path)
+    let output = git_command(worktree_path)?
         .args(["status", "--porcelain=v2", "--branch"])
         .output()
         .with_context(|| {
@@ -482,10 +651,48 @@ pub fn worktree_stats(worktree_path: &Path) -> Result<WorktreeStats> {
     })
 }
 
+/// Git forms the registration name by sanitizing the basename as a refname
+/// component, then appending 1, 2, ... on collision. Compute it *before*
+/// `worktree add`, without changing checkout or hook execution. If allocation
+/// races or Git chooses a different name, refuse rather than guess again.
+fn planned_worktree_admin(common: &Path, path: &Path) -> Result<PathBuf> {
+    let basename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("invalid worktree basename")?;
+    let mut stem = String::new();
+    let mut previous = None;
+    for c in basename.chars() {
+        let next = match c {
+            '.' if previous == Some('.') => continue,
+            '.' if previous.is_none() => '-',
+            '{' if previous == Some('@') => '-',
+            '\0'..=' ' | '\x7f' | '~' | '^' | ':' | '?' | '*' | '[' | '\\' => '-',
+            _ => c,
+        };
+        stem.push(next);
+        previous = Some(c);
+    }
+    let stem = stem.trim_end_matches(".lock");
+    let stem = if basename == "@" { "-" } else { stem };
+    let mut candidate = common.join("worktrees").join(stem);
+    let mut suffix = 1u64;
+    while candidate.try_exists()? {
+        candidate.set_file_name(format!("{stem}{suffix}"));
+        suffix += 1;
+    }
+    Ok(candidate)
+}
+
 pub fn worktree_add(repo_root: &Path, branch: &str, path: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let repo = Repository::open(repo_root)?;
+    let origin = Identity::at_root(repo_root, &repo)?;
+    let planned_root = canonicalize_deepest_existing(path)?;
+    let registrations = repo.worktrees()?;
+    let before: std::collections::HashSet<_> = registrations.iter_bytes().collect();
+    let planned_admin = planned_worktree_admin(&origin.common, path)?;
+    let output = origin
+        .command()?
         .args(["worktree", "add", "-b"])
         .arg(branch)
         .arg("--")
@@ -503,13 +710,50 @@ pub fn worktree_add(repo_root: &Path, branch: &str, path: &Path) -> Result<()> {
         "git worktree add failed for branch {branch}: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
-    Ok(())
+    // post-checkout could have replaced the source, redirected the planned
+    // path or moved an existing registration into its place. Do not let the
+    // caller copy files or run Lucus hooks until both endpoints check out.
+    ensure!(
+        Identity::open(repo_root)? == origin,
+        "source checkout changed during worktree add"
+    );
+    let target_repo = Repository::open(path).context("cannot reopen newly created worktree")?;
+    let target = origin.linked_target(path, &target_repo)?;
+    // Also require an unambiguous allocation. A second new registration
+    // (from a hook or concurrent add) is not evidence of the planned one.
+    let after = repo.worktrees()?;
+    let mut new_names = after.iter_bytes().filter(|name| !before.contains(name));
+    let planned_name = planned_admin
+        .file_name()
+        .context("missing registration name")?;
+    ensure!(
+        target.root == planned_root
+            && target.admin == planned_admin
+            && new_names.next() == Some(planned_name.as_encoded_bytes())
+            && new_names.next().is_none(),
+        "new worktree registration or destination changed at {}",
+        path.display()
+    );
+    let head = target_repo.head()?;
+    ensure!(
+        head.is_branch() && head.name_bytes() == format!("refs/heads/{branch}").as_bytes(),
+        "new worktree is not attached to requested branch {branch}"
+    );
+    target.pin_target()
 }
 
 pub fn worktree_remove(repo_root: &Path, path: &Path, force: bool) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let origin = Identity::open(repo_root)?;
+    let target = origin.linked_target(path, &Repository::open(path)?)?;
+    if let Some(ctx) = INVOCATION.get() {
+        ensure!(
+            ctx.target.get() == Some(&target),
+            "worktree registration at {} no longer matches the original target; refusing removal",
+            path.display()
+        );
+    }
+    let output = origin
+        .command()?
         .args(["worktree", "remove"])
         .args(force.then_some("--force"))
         .arg("--")
@@ -531,9 +775,7 @@ pub fn worktree_remove(repo_root: &Path, path: &Path, force: bool) -> Result<()>
 }
 
 pub fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let output = git_command(repo_root)?
         .args(["show-ref", "--verify", "--quiet"])
         .arg("--")
         .arg(format!("refs/heads/{branch}"))
@@ -549,9 +791,7 @@ pub fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool> {
 
 pub fn branch_delete(repo_root: &Path, branch: &str, force: bool) -> Result<()> {
     let flag = if force { "-D" } else { "-d" };
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
+    let output = git_command(repo_root)?
         .args(["branch", flag])
         .arg("--")
         .arg(branch)

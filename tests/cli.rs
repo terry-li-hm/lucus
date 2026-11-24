@@ -35,10 +35,16 @@ impl Fixture {
     }
 
     fn lucus_in(&self, cwd: &Path, args: &[&str]) -> Output {
+        self.lucus_command(cwd, args)
+            .output()
+            .expect("lucus should run")
+    }
+
+    fn lucus_command(&self, cwd: &Path, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_lucus"));
         cmd.current_dir(cwd).args(args);
         apply_isolation(&mut cmd, &self.root);
-        cmd.output().expect("lucus should run")
+        cmd
     }
 
     fn write_config(&self, body: &str) {
@@ -62,25 +68,25 @@ impl Drop for Fixture {
 }
 
 fn apply_isolation(cmd: &mut Command, home: &Path) {
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(key);
+        }
+    }
     cmd.env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("XDG_CACHE_HOME", home.join(".cache"))
         .env("XDG_STATE_HOME", home.join(".local/state"))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", home.join("gitconfig"))
         .env("GIT_AUTHOR_NAME", "Lucus Test")
         .env("GIT_AUTHOR_EMAIL", "lucus-test@example.com")
         .env("GIT_COMMITTER_NAME", "Lucus Test")
-        .env("GIT_COMMITTER_EMAIL", "lucus-test@example.com")
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_TEMPLATE_DIR");
+        .env("GIT_COMMITTER_EMAIL", "lucus-test@example.com");
 }
 
 fn write_gitconfig(home: &Path) {
     fs::write(
-        home.join("gitconfig"),
+        home.join(".gitconfig"),
         "[user]\n    name = Lucus Test\n    email = lucus-test@example.com\n[commit]\n    gpgsign = false\n[init]\n    defaultBranch = main\n",
     )
     .expect("write gitconfig");
@@ -160,12 +166,364 @@ fn branch_exists(fx: &Fixture, branch: &str) -> bool {
         .success()
 }
 
+// Capture refs, the actual index bytes, registrations and worktree contents
+// (including untracked files) without letting the observer refresh the index.
+fn snapshot(fx: &Fixture) -> Vec<Vec<u8>> {
+    let tracked = fx.repo.join("README.md");
+    vec![
+        git(&fx.repo, &fx.root, &["show-ref", "--head"]).stdout,
+        fs::read(fx.repo.join(".git/index")).unwrap(),
+        git(&fx.repo, &fx.root, &["worktree", "list", "--porcelain"]).stdout,
+        git(
+            &fx.repo,
+            &fx.root,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+            ],
+        )
+        .stdout,
+        fs::read(tracked).unwrap(),
+    ]
+}
+
+fn assert_overrides_refused(
+    local: &Fixture,
+    foreign: &Fixture,
+    args: &[&str],
+    vars: &[(&str, &Path)],
+) {
+    let before = [snapshot(local), snapshot(foreign)];
+    for &(key, value) in vars {
+        let out = local
+            .lucus_command(&local.repo, args)
+            .env(key, value)
+            .output()
+            .unwrap();
+        assert_failure(&out);
+        assert!(stderr(&out).contains(key), "{}", stderr(&out));
+        assert!(out.stdout.is_empty(), "{}", stdout(&out));
+        assert_eq!(
+            [snapshot(local), snapshot(foreign)],
+            before,
+            "state changed under {key}"
+        );
+    }
+}
+
+#[test]
+fn git_context_override_refuses_branch_only_force_without_ref_changes() {
+    let local = Fixture::new("force-local");
+    let foreign = Fixture::new("force-foreign");
+    for fx in [&local, &foreign] {
+        git(&fx.repo, &fx.root, &["branch", "fixture-topic"]);
+    }
+    let admin = foreign.repo.join(".git");
+    assert_overrides_refused(
+        &local,
+        &foreign,
+        &["remove", "--force", "fixture-topic"],
+        &[
+            ("GIT_DIR", &admin),
+            ("GIT_COMMON_DIR", &admin),
+            ("GIT_WORK_TREE", &foreign.repo),
+            ("GIT_CONFIG_PARAMETERS", Path::new("'core.bare=true'")),
+        ],
+    );
+}
+
+#[test]
+fn git_context_override_refuses_new_without_creating_worktree() {
+    let local = Fixture::new("new-local");
+    let foreign = Fixture::new("new-foreign");
+    let objects = foreign.repo.join(".git/objects");
+    assert_overrides_refused(
+        &local,
+        &foreign,
+        &["new", "fixture-new"],
+        &[
+            ("GIT_OBJECT_DIRECTORY", &objects),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", &objects),
+            ("GIT_INDEX_FILE", &foreign.repo.join(".git/index")),
+            ("GIT_CONFIG_COUNT", Path::new("0")),
+        ],
+    );
+    for fx in [&local, &foreign] {
+        assert!(!fx.root.join("repo.fixture-new").exists());
+    }
+}
+
+#[test]
+fn git_context_override_does_not_report_foreign_status() {
+    let local = Fixture::new("list-local");
+    let foreign = Fixture::new("list-foreign");
+    fs::write(foreign.repo.join("README.md"), "foreign change").unwrap();
+    assert_overrides_refused(
+        &local,
+        &foreign,
+        &["list"],
+        &[
+            ("GIT_WORK_TREE", &foreign.repo),
+            ("GIT_CONFIG_GLOBAL", &foreign.root.join(".gitconfig")),
+            ("GIT_CONFIG_SYSTEM", &foreign.root.join(".gitconfig")),
+        ],
+    );
+}
+
+#[test]
+fn remove_rechecks_discovered_origin_after_pre_remove_hook() {
+    let local = Fixture::new("origin-local");
+    let foreign = Fixture::new("origin-foreign");
+    let created = local.lucus(&["new", "fixture-target"]);
+    assert_success(&created);
+    let target = PathBuf::from(stdout(&created).trim());
+    // Point the invoking checkout at another valid repository after lookup.
+    // Agreement between the two Git implementations *now* is not enough.
+    fs::write(
+        local.root.join("redirect"),
+        format!("gitdir: {}\n", foreign.repo.join(".git").display()),
+    )
+    .unwrap();
+    local.write_config(r#"[hooks]
+pre_remove = ['mv "$LUCUS_REPO/.git" "$LUCUS_REPO/../saved" && cp "$LUCUS_REPO/../redirect" "$LUCUS_REPO/.git"']
+"#);
+    let foreign_before = snapshot(&foreign);
+    let out = local.lucus(&["remove", "--force", "fixture-target"]);
+    assert_failure(&out);
+    assert!(stderr(&out).contains("context"), "{}", stderr(&out));
+    assert_eq!(snapshot(&foreign), foreign_before);
+    fs::remove_file(local.repo.join(".git")).unwrap();
+    fs::rename(local.root.join("saved"), local.repo.join(".git")).unwrap();
+    assert!(target.join("README.md").is_file());
+    assert!(branch_exists(&local, "fixture-target"));
+}
+
+#[test]
+fn remove_preserves_same_branch_replacement_registration() {
+    let fx = Fixture::new("remove-replacement");
+    let created = fx.lucus(&["new", "fixture-target"]);
+    assert_success(&created);
+    let path = PathBuf::from(stdout(&created).trim());
+    let original = fs::read(path.join(".git")).unwrap();
+    fx.write_config(
+        r#"[hooks]
+pre_remove = [
+    'git -C "$LUCUS_WORKTREE_PATH" checkout --detach',
+    'git -C "$LUCUS_REPO" worktree move "$LUCUS_WORKTREE_PATH" "$HOME/original"',
+    'git -C "$LUCUS_REPO" worktree add "$LUCUS_WORKTREE_PATH" "$LUCUS_BRANCH"',
+    'echo replacement > "$LUCUS_WORKTREE_PATH/unique"',
+]
+"#,
+    );
+    let out = fx.lucus(&["remove", "--force", "fixture-target"]);
+    assert_failure(&out);
+    assert!(stderr(&out).contains("registration"), "{}", stderr(&out));
+    assert_ne!(fs::read(path.join(".git")).unwrap(), original);
+    assert_eq!(
+        fs::read_to_string(path.join("unique")).unwrap(),
+        "replacement\n"
+    );
+    assert_eq!(
+        stdout(&git(&path, &fx.root, &["symbolic-ref", "--short", "HEAD"])).trim(),
+        "fixture-target"
+    );
+    assert!(branch_exists(&fx, "fixture-target"));
+}
+
+// Install only after creating fixture siblings, so the post-checkout action
+// runs during the `worktree add` under test. The test HOME is the fixture root.
+fn configure_creation_probe(fx: &Fixture, hook: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    fx.write_config(
+        r#"[files]
+copy = ["fixture.txt"]
+[hooks]
+post_create = ['touch "$HOME/lucus-hook-ran"']
+"#,
+    );
+    let path = fx.repo.join(".git/hooks/post-checkout");
+    fs::write(&path, format!("#!/bin/sh\nset -eu\n{hook}\n")).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn assert_creation_stopped(fx: &Fixture, out: &Output, destinations: &[&Path]) {
+    assert_failure(out);
+    assert!(out.stdout.is_empty());
+    for dir in destinations {
+        assert!(
+            dir.join("README.md").is_file(),
+            "missing checkout at {}",
+            dir.display()
+        );
+        assert!(
+            !dir.join("fixture.txt").exists(),
+            "unexpected copy into {}",
+            dir.display()
+        );
+    }
+    assert!(!fx.root.join("lucus-hook-ran").exists());
+}
+
+#[test]
+fn new_refuses_destination_redirected_to_sibling_by_post_checkout() {
+    let fx = Fixture::new("new-redirect");
+    let sibling = fx.root.join("sibling");
+    git(
+        &fx.repo,
+        &fx.root,
+        &["worktree", "add", "-b", "fixture-sibling", "../sibling"],
+    );
+    fs::write(fx.repo.join("fixture.txt"), "source").unwrap();
+    configure_creation_probe(
+        &fx,
+        r#"mv "$HOME/repo.fixture-new" "$HOME/moved"
+ln -s "$HOME/sibling" "$HOME/repo.fixture-new""#,
+    );
+    let out = fx.lucus(&["new", "fixture-new"]);
+    assert_eq!(
+        fx.root.join("repo.fixture-new").canonicalize().unwrap(),
+        sibling.canonicalize().unwrap()
+    );
+    assert_creation_stopped(&fx, &out, &[&sibling, &fx.root.join("moved")]);
+    assert!(
+        stderr(&out).contains("destination changed"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn new_refuses_same_root_same_branch_replacement_during_post_checkout() {
+    let fx = Fixture::new("new-registration-swap");
+    fs::write(fx.repo.join("fixture.txt"), "source").unwrap();
+    configure_creation_probe(
+        &fx,
+        r#"test ! -e "$HOME/started" || exit 0
+ touch "$HOME/started"
+ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+ target="$HOME/repo.fixture-new"
+ git -C "$target" checkout --detach
+ git -C "$HOME/repo" worktree move "$target" "$HOME/moved"
+ git -C "$HOME/repo" worktree add "$target" fixture-new"#,
+    );
+    let out = fx.lucus(&["new", "fixture-new"]);
+    let target = fx.root.join("repo.fixture-new");
+    let moved = fx.root.join("moved");
+    assert_ne!(
+        fs::read(target.join(".git")).unwrap(),
+        fs::read(moved.join(".git")).unwrap()
+    );
+    assert_eq!(
+        stdout(&git(
+            &target,
+            &fx.root,
+            &["symbolic-ref", "--short", "HEAD"]
+        ))
+        .trim(),
+        "fixture-new"
+    );
+    assert_creation_stopped(&fx, &out, &[&moved, &target]);
+    assert!(stderr(&out).contains("registration"), "{}", stderr(&out));
+}
+
+#[test]
+fn new_accepts_numbered_registration_for_shared_basename() {
+    let fx = Fixture::new("new-admin-collision");
+    fx.write_config("[worktree]\npath_template = '../{branch}/shared name'\n");
+    for branch in ["fixture-first", "fixture-second"] {
+        let out = fx.lucus(&["new", branch]);
+        assert_success(&out);
+        assert_eq!(
+            Path::new(stdout(&out).trim()),
+            fx.root
+                .join(branch)
+                .join("shared name")
+                .canonicalize()
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn new_refuses_linked_origin_replaced_during_post_checkout() {
+    let fx = Fixture::new("new-source-swap");
+    for dir in ["origin", "replacement"] {
+        git(
+            &fx.repo,
+            &fx.root,
+            &["worktree", "add", "-b", dir, &format!("../{dir}")],
+        );
+        fs::write(fx.root.join(dir).join("fixture.txt"), dir).unwrap();
+    }
+    configure_creation_probe(
+        &fx,
+        r#"unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+ git -C "$HOME/repo" worktree move "$HOME/origin" "$HOME/moved-origin"
+ git -C "$HOME/repo" worktree move "$HOME/replacement" "$HOME/origin""#,
+    );
+    let origin = fx.root.join("origin");
+    let out = fx.lucus_in(&origin, &["new", "fixture-new"]);
+    assert_eq!(
+        fs::read_to_string(origin.join("fixture.txt")).unwrap(),
+        "replacement"
+    );
+    assert_creation_stopped(&fx, &out, &[&fx.root.join("origin.fixture-new")]);
+    assert!(stderr(&out).contains("context changed"), "{}", stderr(&out));
+}
+
+#[test]
+fn new_refuses_branch_changed_during_post_checkout() {
+    let fx = Fixture::new("new-branch-change");
+    git(&fx.repo, &fx.root, &["branch", "fixture-other"]);
+    fs::write(fx.repo.join("fixture.txt"), "source").unwrap();
+    configure_creation_probe(&fx, "git symbolic-ref HEAD refs/heads/fixture-other");
+    let out = fx.lucus(&["new", "fixture-new"]);
+    let target = fx.root.join("repo.fixture-new");
+    assert_creation_stopped(&fx, &out, &[&target]);
+    assert!(
+        stderr(&out).contains("requested branch"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        stdout(&git(
+            &target,
+            &fx.root,
+            &["symbolic-ref", "--short", "HEAD"]
+        ))
+        .trim(),
+        "fixture-other"
+    );
+}
+
+#[test]
+fn clean_linked_invocation_uses_its_own_checkout() {
+    let fx = Fixture::new("linked");
+    let created = fx.lucus(&["new", "fixture-linked"]);
+    assert_success(&created);
+    let linked = PathBuf::from(stdout(&created).trim());
+    let nested = linked.join("subdir");
+    fs::create_dir(&nested).unwrap();
+    let out = fx.lucus_in(&nested, &["query", "@"]);
+    assert_success(&out);
+    assert_eq!(
+        Path::new(stdout(&out).trim()),
+        linked.canonicalize().unwrap()
+    );
+    git(&fx.repo, &fx.root, &["branch", "fixture-unattached"]);
+    assert_success(&fx.lucus_in(&nested, &["remove", "--force", "fixture-unattached"]));
+    assert!(!branch_exists(&fx, "fixture-unattached"));
+}
+
 #[test]
 fn help_and_version_succeed() {
     let fx = Fixture::new("help");
     let help = fx.lucus(&["--help"]);
     assert_success(&help);
     assert!(stdout(&help).contains("Git worktree manager"));
+    assert!(stdout(&help).contains("GIT_DIR"));
     let version = fx.lucus(&["--version"]);
     assert_success(&version);
     assert!(stdout(&version).contains("lucus"));
